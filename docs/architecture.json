@@ -1,0 +1,1206 @@
+{
+  "$schema": "iora_codecs/architecture/v1",
+  "project": {
+    "name": "iora_codecs",
+    "version": "0.1.0",
+    "description": "General-purpose audio and video codec library for media encoding, decoding, and DSP, built on the Iora framework",
+    "language": "C++17",
+    "buildSystem": "CMake (all external dependencies as git submodules under libs/)",
+    "license": "TBD (all dependencies are permissive: BSD-2, BSD-3, Apache-2.0, Public domain — no GPL)",
+    "repository": "/workspace/iora_codecs"
+  },
+
+  "designPrinciples": [
+    "Reuse Iora framework objects wherever possible — threading, timers, queues, logging, config, network, lifecycle",
+    "Extend Iora with new primitives only when no existing object can serve the purpose",
+    "Plugin-based codec registration matching Iora's plugin architecture",
+    "Zero-copy media pipeline where feasible — minimize allocations in the hot path",
+    "Separation of codec, DSP, and pipeline layers",
+    "Transport-agnostic — this library handles codecs and media processing only; signaling and transport (SIP, WebRTC, SRTP, ICE) belong in separate libraries that consume this one",
+    "Expose clean interfaces so that higher-level transport libraries (e.g., a future libdatachannel bridge or SIP stack) can plug in seamlessly",
+    "Device I/O abstraction provided by the companion iora_io_device library for seamless integration with audio/video capture and playback hardware",
+    "Each codec is a loadable module — applications link only the codecs they need"
+  ],
+
+  "layers": {
+    "overview": "The library is organized into three distinct layers, each depending only on layers below it. Transport, signaling, RTP framing, and device I/O are explicitly out of scope — they belong in companion libraries that share iora_codecs_core types.",
+    "stack": [
+      {
+        "level": 3,
+        "name": "Media Pipeline",
+        "description": "Orchestration layer — connects codecs, DSP stages, and external sources/sinks into processing graphs"
+      },
+      {
+        "level": 2,
+        "name": "Codec",
+        "description": "Encode/decode implementations and codec registry"
+      },
+      {
+        "level": 1,
+        "name": "DSP",
+        "description": "Resampling, gain, VAD, DTMF tone generation/detection, WAV file I/O — audio signal processing utilities"
+      },
+      {
+        "level": 0,
+        "name": "Iora Core (external)",
+        "description": "Threading, timers, logging, config, network transport, lifecycle, crypto — provided by Iora"
+      }
+    ],
+    "outOfScope": [
+      "SIP signaling and SDP offer/answer negotiation",
+      "WebRTC signaling (ICE, DTLS-SRTP, SCTP DataChannels)",
+      "SRTP encryption/decryption",
+      "RTP packet parsing/building, jitter buffering, DTMF, comfort noise — companion iora_rtp library",
+      "RTP transport (socket send/receive) — belongs in iora_rtp or a transport library",
+      "Audio/video device I/O (capture, playback, enumeration) — companion iora_io_device library",
+      "libdatachannel integration — will be a separate bridge library",
+      "SDP generation/parsing — will be handled by the signaling library"
+    ]
+  },
+
+  "ioraReuse": {
+    "description": "Iora objects reused directly by iora_codecs — no wrapping or reimplementation",
+    "components": {
+      "iora::core::ThreadPool": {
+        "usedBy": ["Codec worker threads", "Pipeline task scheduling"],
+        "notes": "Work-stealing pool with dynamic sizing is ideal for variable codec workloads"
+      },
+      "iora::core::TimerService": {
+        "usedBy": ["Codec ptime alignment", "Periodic stats collection", "[iora_rtp] Jitter buffer playout scheduling"],
+        "notes": "Microsecond precision via epoll/timerfd is sufficient for audio frame timing (20ms granularity)"
+      },
+      "iora::core::BlockingQueue<T>": {
+        "usedBy": ["Control plane event queues", "Non-real-time video frame queues (e.g., decode output to display)", "Configuration change dispatch"],
+        "notes": "Bounded queue with timeout provides natural backpressure. Uses std::mutex internally — NOT suitable for the real-time audio hot path. For audio pipeline stages, use RingBuffer<T> instead. BlockingQueue is appropriate for control plane operations and non-latency-critical paths where backpressure semantics (blocking on full) are more important than lock-free performance."
+      },
+      "iora::core::EventQueue": {
+        "usedBy": ["Diagnostic and monitoring events (codec stats export, call quality reports)", "Low-frequency lifecycle events (session start/stop)"],
+        "notes": "JSON event model fits diagnostic and inter-process events. NOT suitable for high-frequency real-time pipeline events (DTMF digits, VAD state changes, key frame requests) due to JSON serialization overhead. For real-time pipeline events, iora_codecs defines typed event structs with std::variant — see MediaEvent in pipeline abstractions."
+      },
+      "iora::core::Logger": {
+        "usedBy": ["All layers — diagnostics, packet loss logging, codec stats, device errors"],
+        "notes": "Async mode preferred for media path to avoid blocking"
+      },
+      "iora::core::ConfigLoader": {
+        "usedBy": ["Codec configuration (bitrates, sample rates, profiles)", "Pipeline topology"],
+        "notes": "TOML config format for codec module settings"
+      },
+      "iora::network::ObjectPool<T>": {
+        "usedBy": ["Media frame buffer pooling", "[iora_rtp] RTP packet buffer pooling"],
+        "notes": "Generic pooling reduces allocation churn in the media hot path"
+      },
+      "iora::network::CircuitBreaker": {
+        "usedBy": ["Codec fallback on repeated encode/decode failures"],
+        "notes": "Fault tolerance pattern for unreliable codec paths"
+      },
+      "iora::common::ILifecycleManaged": {
+        "usedBy": ["Pipeline lifecycle", "Device lifecycle (in iora_io_device)"],
+        "notes": "Standard Created→Running→Draining→Stopped→Reset state machine for pipeline objects. ICodec does NOT implement ILifecycleManaged — codecs are lightweight construction-ready/destruction-cleanup objects. Device lifecycle is managed by iora_io_device."
+      },
+      "iora::crypto::SecureRng": {
+        "usedBy": ["SSRC generation in iora_rtp for RTP packet assembly"],
+        "notes": "OpenSSL-based CSPRNG. Used by iora_rtp (not iora_codecs) for SSRC generation. SSRC uniqueness (not cryptographic strength) is the requirement per RFC 3550 — std::random_device seeding std::mt19937 is an acceptable fallback if SecureRng requires OpenSSL at link time."
+      },
+      "iora::util::ExpiringCache<K,V>": {
+        "usedBy": ["Caching external lookup results", "Optional RTCP stats aggregation with TTL-based cleanup (in iora_rtp)", "Device capability caching (in iora_io_device)"],
+        "notes": "TTL-based expiry is useful for caching results from external systems. NOT used for CodecRegistry lookups — registered codecs do not expire, so a simple std::unordered_map is more appropriate and avoids unnecessary TTL overhead on the codec hot path."
+      },
+      "iora::ids::Uuid": {
+        "usedBy": ["Media session identifiers", "Pipeline node IDs"],
+        "notes": "UUID v7 (time-ordered) for session correlation in logs"
+      },
+      "iora::parsers::Json": {
+        "usedBy": ["Codec capability advertisement", "Media stats export", "Pipeline configuration"],
+        "notes": "Zero-dependency JSON for structured data exchange"
+      },
+      "iora::storage::JsonFileStore": {
+        "usedBy": ["Persistent codec statistics", "Call quality metrics history"],
+        "notes": "Optional — only for long-running diagnostic collection"
+      },
+      "iora::common::PluginLoader": {
+        "usedBy": ["Loading codec plugins (.so/.dylib) at runtime", "Device driver plugins in iora_io_device (ALSA, PulseAudio, V4L2)"],
+        "notes": "Iora's PluginLoader wraps dlopen/dlsym with RTLD_NOW | RTLD_GLOBAL (required so all plugins share the same Logger/IoraService singletons from the header-only library). Codec modules are loaded as Iora plugins — each .so exports a factory that registers with CodecRegistry during onLoad()."
+      },
+      "iora::common::PluginManager": {
+        "usedBy": ["Codec plugin lifecycle management", "Plugin dependency resolution", "Plugin enumeration"],
+        "notes": "Manages loaded plugins and their lifecycle. CodecRegistry delegates plugin discovery to PluginManager."
+      }
+    }
+  },
+
+  "ioraExtensions": {
+    "description": "New primitives that must be added to the Iora base framework — only those general-purpose enough to belong in Iora itself, not in iora_codecs. Currently none required by iora_codecs.",
+    "required": [],
+    "_note_ringbuffer": "iora::core::RingBuffer<T> (lock-free SPSC circular buffer) was previously listed here but its primary consumer is JitterBuffer in iora_rtp. It will be proposed as an Iora extension when iora_rtp is implemented."
+  },
+
+  "externalDependencies": {
+    "description": "All external libraries managed as git submodules under libs/. Iora itself is also a submodule. CMake add_subdirectory() or ExternalProject_Add is used to build each submodule. This matches the pattern used in the karoo_sbc project.",
+    "integrationMethod": {
+      "strategy": "git submodules",
+      "submoduleRoot": "libs/",
+      "initialization": "git submodule update --init --recursive",
+      "cmakeIntegration": "add_subdirectory() for CMake-native libs, ExternalProject_Add for autotools/Meson libs",
+      "pinning": "Each submodule is pinned to a specific tag/commit for reproducible builds"
+    },
+
+    "framework": {
+      "iora": {
+        "submodulePath": "libs/iora",
+        "source": "https://github.com/joegen/iora.git",
+        "branch": "main",
+        "license": "TBD",
+        "buildSystem": "CMake (header-only for subdirectory consumers)",
+        "cmakeIntegration": "Manual INTERFACE library pointing at libs/iora/include (iora's own CMakeLists.txt is not designed for add_subdirectory — it uses CMAKE_SOURCE_DIR and always builds the iora executable)",
+        "purpose": "Base framework — threading, timers, logging, config, network, lifecycle, crypto"
+      }
+    },
+
+    "audioCodecs": {
+      "libopus": {
+        "submodulePath": "libs/opus",
+        "source": "https://github.com/xiph/opus.git",
+        "tag": "v1.5.2",
+        "license": "BSD-3-Clause",
+        "buildSystem": "CMake",
+        "cmakeIntegration": "add_subdirectory(libs/opus)",
+        "purpose": "Opus encode/decode — mandatory modern VoIP audio codec",
+        "features": ["VoIP mode with in-band FEC", "8-48 kHz sample rates", "6-510 kbps bitrate range", "20ms default frame size"],
+        "notes": "Use OPUS_APPLICATION_VOIP for telephony. Can run at 8kHz for efficient bridging with G.711."
+      },
+      "_g729_removed": {
+        "reason": "G.729 (bcg729) has been removed. GPL-3.0 is incompatible with iora_codecs' permissive license model. Runtime isolation via dlopen/RTLD_LOCAL is not feasible because Iora's header-only architecture requires RTLD_GLOBAL for shared singleton state (Logger, IoraService). G.729 patents have expired — a clean-room BSD-licensed implementation could be added in the future."
+      },
+      "g711": {
+        "submodulePath": "N/A",
+        "source": "built-in",
+        "license": "Public domain",
+        "buildSystem": "N/A",
+        "cmakeIntegration": "N/A (inline implementation)",
+        "purpose": "G.711 mu-law and A-law encode/decode",
+        "features": ["Per-sample lookup table", "64 kbps fixed", "8 kHz"],
+        "notes": "Trivial — ~40 lines of code. No external library needed. Implement inline."
+      },
+      "libg722": {
+        "submodulePath": "libs/libg722",
+        "source": "https://github.com/sippy/libg722.git",
+        "tag": "v1.2.5",
+        "license": "BSD / Public domain (ITU reference)",
+        "buildSystem": "Makefile (simple — a few .c files)",
+        "cmakeIntegration": "Custom CMakeLists.txt wrapping the .c/.h files, or compile sources directly into the g722 codec module",
+        "purpose": "G.722 wideband encode/decode — 7 kHz audio at 64 kbps",
+        "features": ["Sub-band ADPCM", "16 kHz audio (8 kHz RTP clock — historical error)", "48/56/64 kbps modes"],
+        "notes": "Small enough to compile directly. A few .c/.h files."
+      },
+      "libilbc": {
+        "submodulePath": "libs/libilbc",
+        "source": "https://github.com/TimothyGu/libilbc.git",
+        "tag": "main",
+        "license": "BSD-3-Clause (WebRTC project)",
+        "buildSystem": "CMake (requires abseil-cpp submodule: git submodule update --init --recursive)",
+        "cmakeIntegration": "add_subdirectory(libs/libilbc)",
+        "purpose": "iLBC encode/decode — codec with good packet loss resilience",
+        "features": ["20ms mode at 15.20 kbps", "30ms mode at 13.33 kbps", "8 kHz narrowband"],
+        "notes": "Still encountered in legacy deployments and useful for high packet-loss environments."
+      },
+      "opencore-amr": {
+        "submodulePath": "libs/opencore-amr",
+        "source": "https://github.com/BelledonneCommunications/opencore-amr.git",
+        "tag": "master",
+        "license": "Apache-2.0",
+        "buildSystem": "Autotools",
+        "cmakeIntegration": "ExternalProject_Add with configure/make, or use GitHub mirror with CMake support",
+        "purpose": "AMR-NB encode/decode, AMR-WB decode — 3GPP mobile codec for VoLTE interworking",
+        "features": ["AMR-NB: 4.75-12.2 kbps, 8 kHz", "AMR-WB: 6.6-23.85 kbps, 16 kHz (decode only)"],
+        "notes": "Patent encumbered — Via Licensing patent license may be required for commercial deployment. AMR-WB encoder available separately via vo-amrwbenc."
+      },
+      "vo-amrwbenc": {
+        "submodulePath": "libs/vo-amrwbenc",
+        "source": "https://github.com/BelledonneCommunications/vo-amrwbenc.git",
+        "tag": "master",
+        "license": "Apache-2.0",
+        "buildSystem": "Autotools",
+        "cmakeIntegration": "ExternalProject_Add with configure/make",
+        "purpose": "AMR-WB (G.722.2) encoder — companion to opencore-amr's decoder",
+        "notes": "Same patent considerations as opencore-amr."
+      }
+    },
+
+    "dsp": {
+      "libspeexdsp": {
+        "submodulePath": "libs/speexdsp",
+        "source": "https://github.com/xiph/speexdsp.git",
+        "tag": "SpeexDSP-1.2.1",
+        "license": "BSD-3-Clause",
+        "buildSystem": "Autotools",
+        "cmakeIntegration": "Direct source compilation — only resample.c is compiled into a static library (speexdsp) with a generated speexdsp_config_types.h providing platform type definitions. No ExternalProject_Add or autotools needed.",
+        "purpose": "Audio resampler (speex_resampler) — NOT the Speex codec, just the DSP utilities",
+        "features": ["Arbitrary sample rate conversion", "Quality levels 0-10", "SIMD optimized", "Low latency mode"],
+        "notes": "The speex_resampler is the de facto standard audio resampler in open source. Essential for bridging 48kHz Opus with 8kHz G.711. Only speex_resampler.c and speex_resampler.h are needed — can be compiled directly."
+      }
+    },
+
+    "videoCodecs": {
+      "openh264": {
+        "submodulePath": "libs/openh264",
+        "source": "https://github.com/cisco/openh264.git",
+        "tag": "v2.5.0",
+        "license": "BSD-2-Clause",
+        "buildSystem": "Meson / Make",
+        "cmakeIntegration": "ExternalProject_Add with make, or use Cisco prebuilt binaries",
+        "purpose": "H.264 encode/decode — Cisco pays MPEG-LA royalties for prebuilt binaries",
+        "features": ["Baseline/Constrained Baseline encode", "All profiles decode", "SVC temporal layers", "Rate control"],
+        "notes": "Royalty-free ONLY when using Cisco's prebuilt binaries. If compiling from source, user must obtain separate MPEG-LA license."
+      },
+      "libvpx": {
+        "submodulePath": "libs/libvpx",
+        "source": "https://chromium.googlesource.com/webm/libvpx.git",
+        "tag": "v1.14.1",
+        "license": "BSD-3-Clause",
+        "buildSystem": "configure/make (custom build system)",
+        "cmakeIntegration": "ExternalProject_Add with ./configure && make",
+        "purpose": "VP8 and VP9 encode/decode — patent-free",
+        "features": ["VP8: fast real-time encode", "VP9: 30-50% bitrate savings over VP8", "Multi-threaded encode", "Rate control"],
+        "notes": "Not CMake-native. Uses its own configure/make build. ExternalProject_Add is the correct integration pattern. Google's royalty-free patent commitment covers all users."
+      },
+      "libaom": {
+        "submodulePath": "libs/libaom",
+        "source": "https://aomedia.googlesource.com/aom.git",
+        "tag": "v3.10.0",
+        "license": "BSD-2-Clause",
+        "buildSystem": "CMake",
+        "cmakeIntegration": "ExternalProject_Add (add_subdirectory pollutes global CMAKE_C_FLAGS with -Werror, breaking other submodules)",
+        "purpose": "AV1 encode/decode — next-generation royalty-free video codec",
+        "features": ["Real-time mode (speed 9-11)", "30% bitrate savings over VP9", "Film grain synthesis", "Screen content coding"],
+        "optional": true,
+        "notes": "CPU-intensive. Real-time encode viable on modern hardware. Decode is lightweight. dav1d is a faster decoder-only alternative."
+      },
+      "dav1d": {
+        "submodulePath": "libs/dav1d",
+        "source": "https://code.videolan.org/videolan/dav1d.git",
+        "tag": "1.5.0",
+        "license": "BSD-2-Clause",
+        "buildSystem": "Meson",
+        "cmakeIntegration": "ExternalProject_Add with meson setup/compile",
+        "purpose": "AV1 decode only — fastest available AV1 decoder",
+        "features": ["SIMD optimized (NEON, AVX2, AVX-512)", "Multi-threaded frame/tile decoding", "Low memory footprint"],
+        "optional": true,
+        "notes": "Use dav1d for decode + libaom for encode if AV1 support is needed. Meson build system requires ExternalProject_Add."
+      }
+    }
+  },
+
+  "coreAbstractions": {
+    "description": "Core interfaces and classes defined by iora_codecs",
+
+    "mediaAbstraction": {
+      "MediaBuffer": {
+        "location": "include/iora/codecs/core/media_buffer.hpp",
+        "description": "Reference-counted, poolable byte buffer with metadata for media frames",
+        "requirements": [
+          "Pre-allocated from a pool (integrates with iora::network::ObjectPool)",
+          "Reference-counted via std::shared_ptr with custom deleter returning to pool — enables shared ownership for fan-out scenarios (e.g., recording + playback simultaneously)",
+          "Metadata: timestamp (uint32_t), sequence number (uint16_t), SSRC (uint32_t), payload type (uint8_t), marker bit (bool), capture time (steady_clock::time_point)",
+          "Capacity vs size distinction (allocated capacity, used size)",
+          "Data pointer access without copy (data(), size(), capacity())",
+          "Ownership model: shared_ptr-based shared ownership (NOT move-only — shared_ptr and move-only are contradictory). Shared ownership is needed for fan-out; single-owner pipelines naturally degrade to single shared_ptr holder"
+        ]
+      },
+      "MediaClock": {
+        "location": "include/iora/codecs/core/media_clock.hpp",
+        "description": "Media clock for timestamp generation and synchronization across pipeline stages",
+        "requirements": [
+          "Monotonic clock source based on std::chrono::steady_clock",
+          "Configurable clock rate (e.g., 8000 Hz, 48000 Hz, 90000 Hz) for RTP timestamp generation",
+          "Wall-clock to media-timestamp conversion and vice versa",
+          "Drift measurement between two MediaClock instances (e.g., capture vs playout)",
+          "Thread-safe reads via atomics"
+        ]
+      }
+    },
+
+    "codecAbstraction": {
+      "ICodec": {
+        "location": "include/iora/codecs/codec/i_codec.hpp",
+        "description": "Abstract interface for all audio and video codecs",
+        "lifecycle": "Does NOT implement iora::common::ILifecycleManaged — codec instances are lightweight encode/decode engines. Construction = ready to use; destruction = cleanup.",
+        "interface": {
+          "info()": "Returns CodecInfo (name, type, clockRate, channels, payloadType, bitrate, frameSize)",
+          "encode(inputBuffer)": "Encode raw samples/pixels into compressed frame, returns MediaBuffer",
+          "decode(inputBuffer)": "Decode compressed frame into raw samples/pixels, returns MediaBuffer",
+          "plc(frameSamples)": "Packet loss concealment — generate synthetic frame",
+          "setParameter(key, value)": "Runtime parameter adjustment (bitrate, complexity, etc.)",
+          "getParameter(key)": "Query current parameter value"
+        }
+      },
+      "CodecInfo": {
+        "location": "include/iora/codecs/codec/codec_info.hpp",
+        "description": "Descriptor for codec identity and capabilities",
+        "fields": {
+          "name": "string — e.g., 'opus', 'PCMU', 'H264'",
+          "type": "enum CodecType { AUDIO, VIDEO }",
+          "mediaSubtype": "string — SDP encoding name (e.g., 'opus', 'PCMU', 'H264')",
+          "clockRate": "uint32_t — RTP clock rate in Hz",
+          "channels": "uint8_t — 1 (mono) or 2 (stereo)",
+          "defaultPayloadType": "uint8_t — static PT or 0 for dynamic",
+          "defaultBitrate": "uint32_t — bps",
+          "frameSize": "std::chrono::microseconds — duration of one codec frame (e.g., 20ms)",
+          "features": "bitfield — FEC, DTX, VAD, PLC, VBR, CBR, SVC"
+        }
+      },
+      "ICodecFactory": {
+        "location": "include/iora/codecs/codec/i_codec_factory.hpp",
+        "description": "Factory for creating codec instances — one factory per codec implementation",
+        "interface": {
+          "codecInfo()": "Returns CodecInfo for the codec this factory produces",
+          "supports(info)": "Check if this factory can produce a codec matching the given info",
+          "createEncoder(params)": "Create an encoder instance",
+          "createDecoder(params)": "Create a decoder instance"
+        }
+      },
+      "CodecRegistry": {
+        "location": "include/iora/codecs/codec/codec_registry.hpp",
+        "description": "Central registry for all available codecs — integrates with Iora plugin system",
+        "interface": {
+          "registerFactory(factory)": "Register a codec factory (called by codec plugins on load)",
+          "unregisterFactory(name)": "Remove a codec factory",
+          "createEncoder(info)": "Look up factory by CodecInfo and create encoder",
+          "createDecoder(info)": "Look up factory by CodecInfo and create decoder",
+          "enumerateCodecs()": "List all registered CodecInfo descriptors",
+          "findByName(name)": "Find codec by SDP encoding name",
+          "findByPayloadType(pt)": "Find codec by RTP payload type",
+          "_note_no_negotiate": "SDP codec negotiation is explicitly NOT part of CodecRegistry — it belongs in the signaling library. Signaling libraries use enumerateCodecs/findByName/findByPayloadType to query available codecs and perform their own offer/answer intersection with full SDP context."
+        },
+        "notes": "Singleton owned by the iora_codecs host library and accessed through IoraService exported APIs — NOT through a static CodecRegistry::instance() call. The host library creates the single CodecRegistry and exports it via service->exportApi(). Codec plugins access it through their IoraService* pointer: service->callExportedApi<void, ICodecFactory*>('codecs.registerFactory', factory.get()). This avoids issues with static singletons in header-only libraries where each .so gets its own instance. External libraries query available codecs the same way — these are infrequent setup-time operations, so callExportedApi is appropriate (e.g., service.callExportedApi<std::vector<CodecInfo>>('codecs.enumerateCodecs')). Codec creation is also infrequent: service.callExportedApi<ICodec*, const CodecInfo&>('codecs.createEncoder', info). The ICodec* returned from createEncoder/createDecoder is then used directly via C++ virtual dispatch for the hot path (encode/decode/plc) — these per-frame calls never go through the exported API system."
+      }
+    },
+
+    "dspAbstraction": {
+      "Resampler": {
+        "location": "include/iora/codecs/dsp/resampler.hpp",
+        "description": "Audio sample rate converter wrapping libspeexdsp's speex_resampler",
+        "interface": {
+          "Resampler(inputRate, outputRate, channels, quality)": "Constructor",
+          "process(input, output)": "Convert sample rate, returns samples written",
+          "reset()": "Reset internal state (e.g., on SSRC change)"
+        }
+      },
+      "AudioMixer": {
+        "location": "include/iora/codecs/dsp/audio_mixer.hpp",
+        "description": "Audio mixing engine — takes N decoded PCM input streams and produces per-participant output streams where each participant hears all OTHER participants (N-1 mix semantics for conference calls)",
+        "interface": {
+          "AudioMixer(params)": "Constructor with MixParams (target sample rate, channels, max participants, algorithm)",
+          "addParticipant(participantId)": "Register a participant for mixing",
+          "removeParticipant(participantId)": "Unregister a participant",
+          "pushAudio(participantId, buffer)": "Submit a decoded PCM frame from one participant",
+          "mixFor(participantId)": "Returns a mixed MediaBuffer containing audio from all OTHER participants (N-1 mix)",
+          "participantCount()": "Number of active participants"
+        },
+        "algorithms": {
+          "SampleAverage": "Simple average of all N-1 input samples — prevents clipping by dividing by source count",
+          "SaturatingAdd": "Sum samples with int16_t saturation clamping — louder but clips with many participants",
+          "AgcNormalized": "Automatic gain control after summing — maintains consistent output level regardless of participant count"
+        },
+        "inputFormat": "S16 PCM (int16_t) — all inputs must be S16 at the target sample rate. TranscodingHandler upstream handles codec decoding and resampling. AudioMixer does NOT perform format conversion.",
+        "designNotes": [
+          "Per-participant Resampler instances normalize all inputs to a common target sample rate before mixing",
+          "Pre-allocated intermediate buffers (one per participant + one output) avoid per-frame heap allocations",
+          "N-1 mix: for each participant P, mix = sum of all OTHER participants' audio. This requires either N separate mix passes or a single sum with per-participant subtraction (subtract P's contribution from the total sum)",
+          "Efficient N-1 via subtraction: compute total_sum once, then for each participant P: output_P = total_sum - P. This is O(N) instead of O(N^2)",
+          "Accumulator type: total_sum MUST be int32_t (not int16_t) to prevent overflow when summing N participants. Example: 4 participants at max amplitude (32767) → sum = 131068, which overflows int16_t. Final per-participant output is clamped to int16_t range [-32768, 32767] after subtraction and optional division.",
+          "NOT thread-safe — caller must synchronize pushAudio() and mixFor() calls. Typical pattern: all pushAudio() calls complete, then all mixFor() calls, within a single timer tick"
+        ]
+      },
+      "Gain": {
+        "location": "include/iora/codecs/dsp/gain.hpp",
+        "description": "Header-only audio gain/volume control with saturation clamping, mute/unmute, and dB conversion",
+        "interface": {
+          "Gain(factor)": "Constructor — linear gain factor (0.0 = silence, 1.0 = unity). Rejects negative, NaN, and infinity values.",
+          "apply(samples, sampleCount)": "Apply gain to S16 PCM samples in-place with saturation clamping to [-32768, 32767]",
+          "apply(MediaBuffer&)": "Convenience — applies gain to a MediaBuffer's S16 PCM data. Rejects odd-byte buffers (not aligned to int16_t).",
+          "gain()": "Get current linear gain factor",
+          "setGain(factor)": "Set linear gain factor (validates input, updates mute-stored value)",
+          "gainDb()": "Get current gain in decibels (returns -infinity for zero gain)",
+          "setGainDb(dB)": "Set gain from decibel value (10^(dB/20))",
+          "mute()": "Mute — stores current gain and sets effective gain to 0",
+          "unmute()": "Unmute — restores previously stored gain",
+          "isMuted()": "Query mute state"
+        },
+        "handler": "GainHandler — IMediaHandler wrapper that applies Gain to both incoming and outgoing MediaBuffers",
+        "designNotes": [
+          "Float-domain comparison before int cast prevents int32_t overflow UB on extreme gain factors",
+          "Null pointer guard on apply() for defensive programming",
+          "setGain() while muted updates the stored unmute value so the new gain takes effect on unmute"
+        ]
+      },
+      "Vad": {
+        "location": "include/iora/codecs/dsp/vad.hpp",
+        "description": "Header-only energy-based Voice Activity Detection with RMS threshold, hangover logic, and speech onset marking",
+        "interface": {
+          "Vad(params)": "Constructor with VadParams (silenceThresholdRms, hangoverFrames)",
+          "process(samples, sampleCount)": "Analyze frame — returns VadResult {isActive, rmsEnergy, peakAmplitude}",
+          "process(MediaBuffer&)": "Convenience — processes a MediaBuffer's S16 PCM data",
+          "reset()": "Clear hangover state"
+        },
+        "handler": "VadHandler — IMediaHandler with separate Vad instances per direction (incoming/outgoing)",
+        "modes": {
+          "DROP_SILENT": "Silent frames are not forwarded to the next handler",
+          "MARK_ONLY": "All frames forwarded — speech onset frames get the RFC 3550 §5.1 marker bit set"
+        },
+        "designNotes": [
+          "Separate _vadIncoming and _vadOutgoing instances prevent cross-direction state interference",
+          "Counter overflow protection on _consecutiveSilenceFrames (uint32_t max guard)",
+          "Marker bit set only on speech onset (transition from inactive→active), not on continuation"
+        ]
+      },
+      "ToneGenerator": {
+        "location": "include/iora/codecs/dsp/tone_generator.hpp",
+        "description": "Header-only DTMF tone synthesizer per ITU-T Q.23 — generates dual-tone signals for all 16 DTMF digits",
+        "interface": {
+          "ToneGenerator(sampleRate)": "Constructor with sample rate (8000, 16000, 48000 Hz)",
+          "generate(digit, durationMs, amplitude)": "Generate a single DTMF tone as a MediaBuffer. Returns nullptr for invalid digits or zero duration.",
+          "generateSilence(durationMs)": "Generate a silence buffer. Returns nullptr for zero duration.",
+          "generateSequence(digits, toneDurationMs, gapDurationMs, amplitude)": "Generate a sequence of tones with inter-digit silence gaps",
+          "dtmfFrequencies(digit)": "Static — returns {lowFreq, highFreq} pair for a DTMF digit"
+        },
+        "designNotes": [
+          "Double-precision phase accumulator prevents frequency drift",
+          "uint64_t widening for sampleRate*durationMs prevents overflow at 48kHz/90s",
+          "Saturation clamping via int32_t intermediate before int16_t cast",
+          "Supports all 16 DTMF digits: 0-9, *, #, A, B, C, D"
+        ]
+      },
+      "GoertzelDetector": {
+        "location": "include/iora/codecs/dsp/goertzel_detector.hpp",
+        "description": "Header-only DTMF detector using the Goertzel algorithm — O(N) per-frequency DFT magnitude computation with ITU-T Q.24 twist limits",
+        "interface": {
+          "GoertzelDetector(sampleRate, params)": "Constructor with GoertzelParams (energyThreshold, normalTwistDb, reverseTwistDb, minDurationMs)",
+          "detect(samples, sampleCount)": "Detect DTMF digit — returns GoertzelResult {detected, digit}",
+          "detect(MediaBuffer&)": "Convenience — detects from a MediaBuffer's S16 PCM data",
+          "reset()": "Clear duration tracking state"
+        },
+        "handler": "GoertzelHandler — IMediaHandler with separate detectors per direction, invokes DtmfCallback(char digit, uint32_t durationMs) on detection. Audio is forwarded unchanged (passive tap).",
+        "designNotes": [
+          "Asymmetric twist limits per ITU-T Q.24: normalTwistDb=4.0 (high > low), reverseTwistDb=8.0 (low > high)",
+          "Duration tracking across frames with _currentDigit, _consecutiveMs, _lastReportedDigit",
+          "std::max(0.0, result) on magnitude prevents negative values from floating-point rounding",
+          "Separate detector instances per direction (incoming/outgoing) prevent cross-direction state"
+        ]
+      },
+      "WavWriter": {
+        "location": "include/iora/codecs/dsp/wav_writer.hpp",
+        "description": "Header-only WAV file writer — writes standard RIFF WAV format with PCM data. Supports streaming writes with deferred header finalization.",
+        "interface": {
+          "WavWriter(params)": "Constructor with WavParams {sampleRate, channels, bitsPerSample}",
+          "open(filePath)": "Open file for writing — writes initial WAV header with placeholder sizes. Returns bool.",
+          "write(samples, sampleCount)": "Write S16 PCM samples to the data chunk. Returns bool.",
+          "write(MediaBuffer&)": "Convenience — write a MediaBuffer's S16 PCM data. Rejects odd-byte buffers.",
+          "close()": "Finalize WAV header (seek back and write actual data/file sizes) and close file",
+          "isOpen()": "Query whether writer is open",
+          "samplesWritten()": "Total sample count written so far",
+          "bytesWritten()": "Total data bytes written so far",
+          "durationMs()": "Recording duration in milliseconds based on samples written and sample rate"
+        },
+        "handler": "WavRecorderHandler — IMediaHandler passive tap that writes audio to a WAV file AND forwards buffers unchanged to the next handler. Does not modify the media stream.",
+        "handlerInterface": {
+          "WavRecorderHandler(params, filePath, direction)": "Constructor — opens WAV file immediately. RecordDirection selects which direction(s) to record.",
+          "startRecording(filePath)": "Start or restart recording to a new file",
+          "stopRecording()": "Stop recording and finalize WAV file",
+          "isRecording()": "Query recording state",
+          "durationMs()": "Current recording duration"
+        },
+        "recordDirections": {
+          "INCOMING": "Record only incoming audio (received from remote)",
+          "OUTGOING": "Record only outgoing audio (sent to remote)",
+          "BOTH": "Record both directions — interleaves into a single mono file. Dual-file mode (separate files per direction) is a future enhancement."
+        },
+        "designNotes": [
+          "44-byte RIFF WAV header: ChunkID='RIFF', Format='WAVE', Subchunk1ID='fmt ', Subchunk2ID='data'",
+          "AudioFormat=1 (PCM), little-endian byte order throughout",
+          "Header written on open() with placeholder sizes (0xFFFFFFFF), updated on close() by seeking back to offsets 4 and 40",
+          "If close() is not called (crash, etc.), the WAV file is still readable by most players that tolerate incorrect size fields",
+          "Passive tap pattern: WavRecorderHandler writes to disk but always forwards the buffer unchanged — it is invisible to downstream stages",
+          "File I/O uses std::ofstream — not on the real-time hot path for typical call recording use cases, but callers should be aware of potential disk I/O latency"
+        ]
+      },
+      "WavReader": {
+        "location": "include/iora/codecs/dsp/wav_reader.hpp",
+        "description": "Header-only WAV file reader — parses RIFF WAV headers and reads PCM audio data into MediaBuffers",
+        "interface": {
+          "WavReader()": "Default constructor",
+          "open(filePath)": "Open and parse WAV file header. Returns bool.",
+          "read(sampleCount)": "Read N samples into a new MediaBuffer. Returns nullptr at EOF.",
+          "readAll()": "Read entire file into a single MediaBuffer",
+          "close()": "Close file",
+          "isOpen()": "Query whether reader is open",
+          "info()": "Returns WavFileInfo {sampleRate, channels, bitsPerSample, totalSamples, durationMs, dataOffset}",
+          "seek(sampleOffset)": "Seek to a sample position within the data chunk",
+          "remaining()": "Number of samples remaining to read"
+        },
+        "designNotes": [
+          "Validates RIFF/WAVE/fmt /data chunk IDs and AudioFormat=1 (PCM only)",
+          "Supports 8-bit, 16-bit, and 24-bit PCM (bitsPerSample validation)",
+          "Skips unknown chunks between 'fmt ' and 'data' for robustness",
+          "WavFileInfo struct provides metadata without reading audio data",
+          "read(N) returns a MediaBuffer with up to N samples — may return fewer at end of file"
+        ]
+      }
+    },
+
+    "formatAbstraction": {
+      "PixelFormat": {
+        "location": "include/iora/codecs/format/pixel_format.hpp",
+        "description": "Video pixel format descriptors",
+        "enum": ["I420", "NV12", "NV21", "YUY2", "UYVY", "RGB24", "BGR24", "RGBA32", "BGRA32", "P010"],
+        "notes": "P010 is 10-bit 4:2:0 planar format used by AV1 and H.265 HDR profiles. Included to support future HDR video pipelines without breaking the format enum.",
+        "helpers": ["bytesPerPixel()", "isPlanar()", "chromaSubsampling()", "bytesPerFrame(fmt, width, height)", "pixelFormatToString()"]
+      },
+      "SampleFormat": {
+        "location": "include/iora/codecs/format/sample_format.hpp",
+        "description": "Audio sample format descriptors and conversion utilities. Little-endian only — all target platforms (x86, x86_64, ARM/AArch64) are little-endian. Big-endian variants (S16BE, S32BE, F32BE) are omitted to avoid dead code and untestable paths. If a big-endian platform is ever needed, add BE variants at that time with actual hardware to test on.",
+        "enum": ["S16", "S32", "F32", "U8", "MULAW", "ALAW"],
+        "helpers": ["bytesPerSample()", "isFloat()", "isInteger()", "isSigned()", "convert(src, srcFmt, dst, dstFmt, sampleCount)"],
+        "notes": "S16/S32/F32 are implicitly little-endian (no LE suffix needed since BE is not supported). MULAW and ALAW are single-byte encodings — endianness does not apply."
+      }
+    },
+
+    "pipelineAbstraction": {
+      "IMediaHandler": {
+        "location": "include/iora/codecs/pipeline/i_media_handler.hpp",
+        "description": "Base interface for media pipeline processing nodes — chainable handlers that transform MediaBuffers",
+        "interface": {
+          "incoming(mediaBuffer)": "Process media arriving from an external source toward the application (e.g., received → decoded)",
+          "outgoing(mediaBuffer)": "Process media going from the application toward an external sink (e.g., raw → encoded)",
+          "addToChain(next)": "Chain this handler to the next handler",
+          "chainWith(handler)": "Fluent API for building chains"
+        },
+        "notes": "Generic chain-of-responsibility pattern. incoming() and outgoing() execute synchronously in the caller's thread — no hidden queuing or thread hops on the hot path. This keeps latency predictable and avoids lock contention. If a handler needs async processing (e.g., video encode on a worker thread), it must explicitly dispatch to ThreadPool and return immediately. Transport bridge libraries (e.g., a future libdatachannel adapter) can wrap IMediaHandler to integrate with their own pipeline models."
+      },
+      "TranscodingHandler": {
+        "location": "include/iora/codecs/pipeline/transcoding_handler.hpp",
+        "description": "Media handler that decodes from one codec, optionally resamples, and re-encodes to another codec",
+        "reuses": ["ICodec for encode/decode", "Resampler for sample rate conversion", "MediaBuffer for zero-copy frame passing"],
+        "pipeline": "decode → resample (if needed) → encode"
+      },
+      "AudioMixerHandler": {
+        "location": "include/iora/codecs/pipeline/audio_mixer_handler.hpp",
+        "description": "IMediaHandler that mixes N audio input streams into per-participant N-1 output streams for conference calling",
+        "reuses": ["AudioMixer for DSP mixing", "Resampler for per-participant rate normalization", "MediaBufferPool for output buffer allocation", "MediaBuffer for zero-copy frame passing"],
+        "interface": {
+          "AudioMixerHandler(params, bufferPool)": "Constructor with MixParams and optional shared buffer pool",
+          "addParticipant(ssrc)": "Register a participant identified by RTP SSRC",
+          "removeParticipant(ssrc)": "Unregister a participant",
+          "incoming(buffer)": "Receive decoded PCM from a participant (identified by buffer SSRC metadata), buffer it, and trigger mixing when all participants have contributed a frame",
+          "participantCount()": "Number of active participants",
+          "bufferCount(ssrc)": "Per-participant buffered frame count (diagnostic)"
+        },
+        "designNotes": [
+          "incoming() identifies the source participant via MediaBuffer::ssrc() metadata",
+          "Per-participant bounded frame buffer (max 2-3 frames) absorbs arrival jitter",
+          "When all active participants have at least one buffered frame, triggers a mix round",
+          "For each participant, outputs an N-1 mix (all OTHER participants) via per-participant output chains",
+          "Late/missing frames: skip the participant for this mix round rather than blocking. PLC integration is a Phase 2 enhancement.",
+          "NOT thread-safe with respect to addParticipant/removeParticipant and mixing — caller must pause media flow during topology changes",
+          "Output routing: each participant has its own downstream IMediaHandler chain (e.g., encode → RTP packetize → send). AudioMixerHandler maintains an internal map of participantId → output handler. Mixed output is forwarded by calling outputHandler->incoming(mixedBuffer) directly — it does NOT use IMediaHandler::_next. AudioMixerHandler is a fan-in/fan-out terminal node, not a linear chain link.",
+          "Mixing cadence: timer-driven at a fixed interval (e.g., 20ms matching the codec ptime). On each tick, mix whatever frames are available per participant. Missing participants are skipped (silence). This avoids jitter accumulation from waiting for all participants to contribute."
+        ]
+      },
+      "MediaPipeline": {
+        "location": "include/iora/codecs/pipeline/media_pipeline.hpp",
+        "description": "Orchestrator that connects codec handlers, DSP stages, and external sources/sinks into a complete processing graph",
+        "lifecycle": "Implements iora::common::ILifecycleManaged",
+        "reuses": ["iora::core::ThreadPool for worker dispatch", "iora::core::TimerService for periodic stats"],
+        "features": [
+          "Named pipeline stages with typed connections",
+          "Automatic format negotiation between stages",
+          "Hot-swap codec on mid-call renegotiation",
+          "Metrics collection per stage (latency, frame count, drop count)",
+          "Graph topology support: fan-out (one source to multiple sinks, e.g., recording + playback) and fan-in (multiple sources to one sink, e.g., conference mixing via AudioMixerHandler) in addition to linear chains. The pipeline is a directed acyclic graph (DAG), not just a chain. AudioMixerHandler is the initial fan-in implementation — it buffers N participant streams and outputs per-participant N-1 mixes. Full DAG topology with named ports and dynamic routing is a future enhancement."
+        ]
+      }
+    },
+
+    "integrationPoints": {
+      "description": "iora_codecs exposes clean interfaces at its boundaries so that separate transport/signaling libraries can plug in. The library does NOT depend on any transport library.",
+      "inboundInterface": {
+        "description": "Higher-level libraries (SIP stack, WebRTC bridge, etc.) feed raw media data into iora_codecs",
+        "entryPoints": [
+          "IMediaHandler::incoming(MediaBuffer) — push received/depacketized media into the pipeline",
+          "CodecRegistry — transport libraries query available codecs for SDP negotiation"
+        ]
+      },
+      "outboundInterface": {
+        "description": "iora_codecs delivers processed media back to transport libraries",
+        "exitPoints": [
+          "IMediaHandler::outgoing(MediaBuffer) — delivers encoded/processed frames ready for packetization",
+          "Pipeline callbacks — std::function-based callbacks for frame-ready notifications"
+        ]
+      }
+    }
+  },
+
+  "codecModules": {
+    "description": "Every codec module is a full Iora plugin — a shared library (.so/.dylib) that inherits from iora::IoraService::Plugin, implements onLoad()/onUnload(), and is declared via the IORA_DECLARE_PLUGIN macro. This is mandatory, not optional. Each codec plugin registers its ICodecFactory with the CodecRegistry during onLoad() and unregisters during onUnload(). Plugins are loaded by Iora's PluginManager from the directory specified in TOML configuration using RTLD_GLOBAL (required for shared Logger/IoraService singletons). All codec dependencies use permissive licenses (BSD, Apache-2.0, Public domain) — no GPL. For embedded/single-binary deployments, IORA_CODECS_STATIC_PLUGINS=ON (not yet implemented) would compile codec modules as statically-linked Iora plugins.",
+
+    "pluginContract": {
+      "description": "Every codec module MUST follow this contract to be a valid Iora plugin",
+      "baseClass": "iora::IoraService::Plugin",
+      "requiredOverrides": {
+        "onLoad(iora::IoraService* service)": "Called by Iora when the plugin is loaded. The codec plugin MUST: (1) create its ICodecFactory instance, (2) register it with CodecRegistry via service->callExportedApi or direct registry access, (3) optionally export codec-specific APIs via service->exportApi() for runtime configuration",
+        "onUnload()": "Called by Iora when the plugin is unloaded. The codec plugin MUST: (1) unregister its ICodecFactory from CodecRegistry, (2) release all codec instances and resources"
+      },
+      "requiredMacro": "IORA_DECLARE_PLUGIN(ClassName) — must appear at the end of the plugin .cpp file to export the loadModule() symbol for dynamic loading",
+      "optionalOverrides": {
+        "onDependencyLoaded(const std::string& moduleName)": "Notified when a dependency becomes available (e.g., a DSP plugin this codec depends on)",
+        "onDependencyUnloaded(const std::string& moduleName)": "Notified when a dependency is removed — codec should gracefully degrade"
+      },
+      "apiExport": "Codec plugins export their ICodecFactory and runtime-configurable parameters via service->exportApi(*this, name, func) (Plugin& overload for automatic cleanup on unload). Encode/decode are NOT exported as APIs — they are accessed via C++ virtual dispatch on ICodec* instances created by the factory. This avoids API name collisions when multiple encoder instances of the same codec exist (e.g., two Opus encoders for two concurrent calls). The caller's choice of API retrieval method depends on call frequency — see apiAccessPatterns below.",
+      "example_plugin": {
+        "description": "Skeleton of a codec plugin (e.g., iora_codec_opus). The plugin registers its factory and exports config APIs. Encode/decode are NOT exported as APIs — they are C++ virtual calls on ICodec* instances created by the factory.",
+        "pseudocode": [
+          "class OpusCodecPlugin : public iora::IoraService::Plugin {",
+          "public:",
+          "  explicit OpusCodecPlugin(iora::IoraService* service) : Plugin(service) {}",
+          "",
+          "  void onLoad(iora::IoraService* service) override {",
+          "    // Register factory with CodecRegistry via exported API",
+          "    // (NOT CodecRegistry::instance() — avoids RTLD_LOCAL singleton issues)",
+          "    _factory = std::make_shared<OpusCodecFactory>();",
+          "    service->callExportedApi<void, ICodecFactory*>(\"codecs.registerFactory\", _factory.get());",
+          "",
+          "    // Export the factory itself — callers retrieve via getExportedApi (~2ns)",
+          "    // for fast codec instance creation at session setup",
+          "    service->exportApi(*this, \"opus.factory\",",
+          "      [this]() -> ICodecFactory* { return _factory.get(); });",
+          "",
+          "    // Export config APIs — callers retrieve via getExportedApiSafe (~25ns, thread-safe)",
+          "    // These operate on a SPECIFIC ICodec instance passed by the caller,",
+          "    // not a plugin-global singleton (supports multiple concurrent sessions)",
+          "    service->exportApi(*this, \"opus.setBitrate\",",
+          "      [](ICodec* codec, std::uint32_t bps) { codec->setParameter(\"bitrate\", bps); });",
+          "    service->exportApi(*this, \"opus.setComplexity\",",
+          "      [](ICodec* codec, int c) { codec->setParameter(\"complexity\", c); });",
+          "    service->exportApi(*this, \"opus.enableFec\",",
+          "      [](ICodec* codec, bool on) { codec->setParameter(\"fec\", on); });",
+          "  }",
+          "",
+          "  void onUnload() override {",
+          "    // exportApi(*this, ...) APIs are automatically unregistered by Iora",
+          "    // because Plugin& overload tracks them in _apiExports for cleanup.",
+          "    _service->callExportedApi<void, const std::string&>(\"codecs.unregisterFactory\", \"opus\");",
+          "  }",
+          "",
+          "private:",
+          "  std::shared_ptr<OpusCodecFactory> _factory;",
+          "  // NOTE: No _encoder/_decoder here — each media session creates its own",
+          "  // ICodec instances via _factory->createEncoder()/createDecoder().",
+          "  // Multiple concurrent sessions each hold their own ICodec*.",
+          "};",
+          "",
+          "IORA_DECLARE_PLUGIN(OpusCodecPlugin);"
+        ]
+      },
+      "example_caller": {
+        "description": "How the pipeline creates codec instances and accesses APIs. Encode/decode use ICodec* virtual dispatch (~1-2ns). Config uses getExportedApiSafe (~25ns). Factory/registry queries use callExportedApi (~120ns).",
+        "pseudocode": [
+          "// === Session setup (once per call, ~120ns — callExportedApi is fine) ===",
+          "",
+          "// Create per-session codec instances via CodecRegistry",
+          "auto* encoder = service.callExportedApi<ICodec*, const CodecInfo&>(",
+          "    \"codecs.createEncoder\", opusInfo);",
+          "auto* decoder = service.callExportedApi<ICodec*, const CodecInfo&>(",
+          "    \"codecs.createDecoder\", opusInfo);",
+          "",
+          "// Cache config APIs via getExportedApiSafe (~25ns per call, thread-safe)",
+          "auto setBitrateFn = service.getExportedApiSafe<void(ICodec*, uint32_t)>(\"opus.setBitrate\");",
+          "auto setFecFn     = service.getExportedApiSafe<void(ICodec*, bool)>(\"opus.enableFec\");",
+          "",
+          "// === Frame loop (called 50+ times/sec) ===",
+          "",
+          "// C++ virtual dispatch on ICodec* — ~1-2ns, NO exported API overhead,",
+          "// no locks, no lookups, no std::function indirection.",
+          "// This is the hot path — encode/decode are virtual method calls, not API calls.",
+          "MediaBuffer encoded = encoder->encode(rawAudio);   // virtual dispatch ~1-2ns",
+          "MediaBuffer decoded = decoder->decode(rtpPayload);  // virtual dispatch ~1-2ns",
+          "MediaBuffer plcFrame = decoder->plc(frameSamples);  // virtual dispatch ~1-2ns",
+          "",
+          "// === Occasional config changes (called ~1/sec or on events) ===",
+          "",
+          "// SafeApiFunction::operator() — ~25ns, mutex + atomic checks, thread-safe",
+          "// Passes the specific ICodec* instance to the exported API lambda",
+          "(*setBitrateFn)(encoder, newBitrate);  // adaptive bitrate",
+          "(*setFecFn)(encoder, packetLossHigh);  // enable FEC when loss > threshold",
+          "",
+          "// === Session teardown ===",
+          "delete encoder;  // or return to pool",
+          "delete decoder;"
+        ]
+      },
+      "configuration": {
+        "description": "Codec plugins are loaded via Iora's TOML configuration, just like any other Iora plugin",
+        "example": [
+          "[modules]",
+          "directory = \"/usr/local/lib/iora_codecs/\"",
+          "modules = [",
+          "    \"iora_codec_opus.so\",",
+          "    \"iora_codec_g711.so\",",
+          "    \"iora_codec_g722.so\",",
+          "    \"iora_codec_ilbc.so\",",
+          "    \"iora_codec_h264.so\",",
+          "    \"iora_codec_vpx.so\"",
+          "]"
+        ]
+      }
+    },
+
+    "apiAccessPatterns": {
+      "description": "Iora provides three API access methods with very different performance characteristics. Each iora_codecs API call site MUST use the correct method based on call frequency. Using callExportedApi on the hot path is a performance bug — 60x slower than getExportedApi.",
+      "methods": {
+        "getExportedApi<Sig>(name)": {
+          "overhead": "~2ns per call",
+          "mechanism": "Returns std::function<Sig> via one-time lock + hash lookup + std::any_cast. After retrieval, calling the returned std::function is a direct function pointer dereference — essentially zero overhead. The std::function is a local copy that the caller caches and reuses.",
+          "threadSafety": "The retrieval itself is mutex-protected, but the returned std::function has NO module-state validation. If the plugin is unloaded while the caller holds the reference, calling it is undefined behavior (dangling pointer). Safe when codec plugins are loaded once at startup and never unloaded during the session lifetime — which is the normal case for media pipelines.",
+          "useFor": "CACHED RETRIEVAL — factory accessors and any plugin API that is called repeatedly and whose plugin will not be unloaded. Cache the std::function at session setup and reuse it. NOTE: encode()/decode()/plc() are NOT exported APIs — they are C++ virtual dispatch on ICodec* (even faster, ~1-2ns vtable lookup). getExportedApi is for retrieving plugin-exported functions like factories."
+        },
+        "getExportedApiSafe<Sig>(name)": {
+          "overhead": "~25ns per call",
+          "mechanism": "Returns shared_ptr<SafeApiFunction<Sig>>. On each call, SafeApiFunction::operator() performs: (1) atomic valid flag check (~1ns), (2) isModuleLoaded() which acquires _loadModulesMutex + hash lookup (~10-15ns), (3) cacheMutex lock with double-checked locking (~10-15ns), (4) cached function call (~2ns). Note: two mutexes are acquired on the fast path (_loadModulesMutex in isModuleLoaded + cacheMutex). The ~25ns figure is measured under zero contention — under heavy multi-thread contention, cost can spike to microseconds due to mutex wait. If the module was reloaded, it transparently refreshes the cached std::function via getExportedApi internally. Uses weak_ptr event handler to auto-invalidate cache on module unload.",
+          "threadSafety": "Fully thread-safe. Handles concurrent calls from multiple threads and survives module reload/unload. The shared_ptr ensures the SafeApiFunction outlives any pending calls.",
+          "useFor": "MEDIUM-FREQUENCY — runtime parameter changes (setBitrate, setComplexity, enableFec, requestKeyFrame) that happen occasionally during a call but need multi-thread safety. Also appropriate for cross-plugin calls where the callee might be reloaded."
+        },
+        "callExportedApi<Ret, Args...>(name, args...)": {
+          "overhead": "~120ns per call",
+          "mechanism": "Full lookup every call: debug log (~10-30ns) + mutex lock (~20ns) + hash lookup (~5ns) + std::any_cast (~2ns) + function call (~2ns). No caching whatsoever — each invocation pays the full cost of name resolution, type validation, and lock acquisition.",
+          "threadSafety": "Thread-safe by virtue of per-call locking. Each call is independent.",
+          "useFor": "INFREQUENT — one-time setup/teardown operations: createEncoder(), createDecoder(), registerFactory(), unregisterFactory(), enumerateCodecs(), findByName(). These happen once per session or once per call setup, so 120ns is negligible."
+        }
+      },
+      "callSiteMapping": {
+        "description": "Concrete mapping of iora_codecs operations to the correct access method. IMPORTANT: encode/decode/plc are NOT exported APIs — they are C++ virtual dispatch on ICodec* instances. Only factory retrieval and config parameters are exported APIs.",
+        "hotPath_virtualDispatch": {
+          "frequency": "50-8000+ calls/sec per stream (depends on codec frame size)",
+          "overhead": "~1-2ns per call (C++ vtable lookup, no API system involvement)",
+          "operations": [
+            "encoder->encode(buffer) — C++ virtual call on ICodec*, called every codec frame (e.g., every 20ms = 50/sec for Opus)",
+            "decoder->decode(buffer) — C++ virtual call on ICodec*, same frequency as encode",
+            "decoder->plc(frameSamples) — C++ virtual call on ICodec*, called on packet loss",
+            "resampler.process(input, output) — direct C++ call, per frame when bridging sample rates"
+          ],
+          "_note_rtp_hotpath": "RTP hot-path operations (jitterBuffer.put/get, RtpPacket::parse/build) are part of the iora_rtp library, not iora_codecs. They share the same zero-overhead design principles (direct C++ calls, no API system involvement).",
+          "pattern": "At session setup, create per-session ICodec* instances via CodecRegistry::createEncoder()/createDecoder(). Store the ICodec* in the pipeline session state. Call encode()/decode()/plc() as virtual method calls for the lifetime of the session. These calls never touch the Iora exported API system — zero overhead beyond a vtable lookup.",
+          "whyNotExportedApi": "Encode/decode cannot be exported APIs because: (1) each session needs its own stateful codec instance — exporting a global 'opus.encode' would be shared across all sessions, which is not thread-safe for stateful codecs; (2) virtual dispatch (~1-2ns) is faster than even getExportedApi's std::function call (~2ns + function pointer dereference); (3) the ICodec interface provides type-safe C++ semantics without std::any_cast overhead."
+        },
+        "mediumPath_getExportedApi": {
+          "frequency": "Once per session setup, then cached",
+          "overhead": "~2ns per call after initial retrieval",
+          "operations": [
+            "opus.factory() — retrieve the ICodecFactory* for fast codec instance creation",
+            "Other factory accessors for each codec type"
+          ],
+          "pattern": "Retrieve the std::function once via getExportedApi at session setup and cache it. The factory itself is stateless, so a single cached reference is safe across all sessions. Codec plugins are loaded at startup and never unloaded mid-session, so the dangling-reference risk of getExportedApi does not apply.",
+          "safety": "Codec plugins are loaded once at startup and remain loaded for the process lifetime. Mid-session codec hot-swap creates NEW ICodec instances from the existing factory rather than reloading the plugin .so."
+        },
+        "mediumFrequency_getExportedApiSafe": {
+          "frequency": "1-10 calls/sec or per-event",
+          "operations": [
+            "opus.setBitrate(bps) — adaptive bitrate changes based on network conditions",
+            "opus.setComplexity(level) — may change based on CPU load",
+            "opus.enableFec(bool) — toggled based on packet loss rate",
+            "h264.requestKeyFrame() / vpx.requestKeyFrame() / av1.requestKeyFrame() — triggered by transport layer on PLI/FIR",
+            "amr.setMode(mode) — AMR rate adaptation"
+          ],
+          "pattern": "Retrieve SafeApiFunction once at session setup via getExportedApiSafe, cache the shared_ptr, call operator() when parameter changes are needed. The ~25ns overhead is irrelevant at this frequency but the thread safety is important since these may be called from network threads, timer callbacks, or control plane threads concurrently."
+        },
+        "infrequent_callExportedApi": {
+          "frequency": "Once per session or once per call setup",
+          "operations": [
+            "codecs.registerFactory(factory) — during plugin onLoad(), once per codec type",
+            "codecs.unregisterFactory(name) — during plugin onUnload()",
+            "codecs.createEncoder(info) — once per media session setup",
+            "codecs.createDecoder(info) — once per media session setup",
+            "codecs.enumerateCodecs() — during SDP offer/answer in signaling library",
+            "codecs.findByName(name) — during SDP negotiation",
+            "codecs.findByPayloadType(pt) — during RTP demux setup",
+            "pipeline.addStage(handler) — once during pipeline construction"
+          ],
+          "pattern": "Call directly via service.callExportedApi<Ret, Args...>(name, args...). No caching needed — 120ns is irrelevant for operations that happen once."
+        }
+      }
+    },
+
+    "modules": {
+      "iora_codec_opus": {
+        "codec": "Opus",
+        "pluginClass": "OpusCodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "libopus",
+        "license": "BSD-3-Clause",
+        "mandatory": true,
+        "features": ["VoIP mode", "Audio mode", "FEC", "DTX", "CBR/VBR", "8-48 kHz", "Mono/Stereo"],
+        "exportedApis": {
+          "factory_getExportedApi": ["opus.factory"],
+          "config_getExportedApiSafe": ["opus.setBitrate", "opus.setComplexity", "opus.enableFec", "opus.enableDtx"]
+        },
+        "hotPath": "encode()/decode()/plc() are C++ virtual dispatch on ICodec* — NOT exported APIs",
+        "notes": "Mandatory for modern VoIP and WebRTC applications."
+      },
+      "iora_codec_g711": {
+        "codec": "G.711 (PCMU + PCMA)",
+        "pluginClass": "G711CodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "none (built-in)",
+        "license": "Public domain",
+        "mandatory": true,
+        "features": ["Mu-law encode/decode", "A-law encode/decode", "64 kbps fixed"],
+        "exportedApis": {
+          "factory_getExportedApi": ["g711.pcmu.factory", "g711.pcma.factory"],
+          "config_getExportedApiSafe": []
+        },
+        "hotPath": "encode()/decode() are C++ virtual dispatch on ICodec* — NOT exported APIs",
+        "notes": "Inline implementation — no external library. Still an Iora plugin for consistency. Always available. No configurable parameters (fixed 64 kbps)."
+      },
+      "iora_codec_g722": {
+        "codec": "G.722",
+        "pluginClass": "G722CodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "libg722 or built-in",
+        "license": "BSD / Public domain",
+        "mandatory": false,
+        "features": ["Wideband (7 kHz)", "48/56/64 kbps modes"],
+        "exportedApis": {
+          "factory_getExportedApi": ["g722.factory"],
+          "config_getExportedApiSafe": ["g722.setMode"]
+        },
+        "hotPath": "encode()/decode() are C++ virtual dispatch on ICodec*"
+      },
+      "iora_codec_ilbc": {
+        "codec": "iLBC",
+        "pluginClass": "IlbcCodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "libilbc",
+        "license": "BSD-3-Clause",
+        "mandatory": true,
+        "features": ["20ms/30ms modes", "Good PLC"],
+        "exportedApis": {
+          "factory_getExportedApi": ["ilbc.factory"],
+          "config_getExportedApiSafe": ["ilbc.setFrameMode"]
+        },
+        "hotPath": "encode()/decode()/plc() are C++ virtual dispatch on ICodec*"
+      },
+      "iora_codec_amr": {
+        "codec": "AMR-NB + AMR-WB",
+        "pluginClass": "AmrCodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "opencore-amr + vo-amrwbenc",
+        "license": "Apache-2.0 (patent encumbered)",
+        "mandatory": false,
+        "features": ["Multi-rate NB", "Wideband encode/decode"],
+        "exportedApis": {
+          "factory_getExportedApi": ["amr-nb.factory", "amr-wb.factory"],
+          "config_getExportedApiSafe": ["amr-nb.setMode", "amr-nb.enableDtx", "amr-wb.setMode", "amr-wb.enableDtx"]
+        },
+        "hotPath": "encode()/decode() are C++ virtual dispatch on ICodec*",
+        "notes": "Patent license from Via Licensing may be required."
+      },
+      "iora_codec_h264": {
+        "codec": "H.264",
+        "pluginClass": "H264CodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "OpenH264",
+        "license": "BSD-2-Clause (royalty-free via Cisco binaries)",
+        "mandatory": false,
+        "features": ["Baseline encode", "All profiles decode", "SVC temporal layers"],
+        "exportedApis": {
+          "factory_getExportedApi": ["h264.factory"],
+          "config_getExportedApiSafe": ["h264.setBitrate", "h264.setProfile", "h264.requestKeyFrame", "h264.setVideoParams"]
+        },
+        "hotPath": "encode()/decode() are C++ virtual dispatch on ICodec*",
+        "notes": "Prefer Cisco prebuilt binaries for royalty-free usage."
+      },
+      "iora_codec_vpx": {
+        "codec": "VP8 + VP9",
+        "pluginClass": "VpxCodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "libvpx",
+        "license": "BSD-3-Clause",
+        "mandatory": false,
+        "features": ["VP8 real-time encode", "VP9 with bitrate savings", "Patent-free"],
+        "exportedApis": {
+          "factory_getExportedApi": ["vpx.vp8.factory", "vpx.vp9.factory"],
+          "config_getExportedApiSafe": ["vpx.setBitrate", "vpx.setSpeed", "vpx.requestKeyFrame", "vpx.setVideoParams"]
+        },
+        "hotPath": "encode()/decode() are C++ virtual dispatch on ICodec*",
+        "notes": "Single plugin registers two factories (VP8 + VP9), following the AMR multi-variant pattern. Config APIs apply to both variants."
+      },
+      "iora_codec_av1": {
+        "codec": "AV1",
+        "pluginClass": "Av1CodecPlugin : public iora::IoraService::Plugin",
+        "dependency": "libaom (encoder) + dav1d (decoder)",
+        "license": "BSD-2-Clause + AOM-Patent-1.0",
+        "mandatory": false,
+        "features": ["Real-time encode (speed 5-11, default 8)", "High-performance decode via dav1d"],
+        "exportedApis": {
+          "factory_getExportedApi": ["av1.factory"],
+          "config_getExportedApiSafe": ["av1.setBitrate", "av1.setSpeed", "av1.requestKeyFrame", "av1.setVideoParams"]
+        },
+        "hotPath": "encode()/decode() are C++ virtual dispatch on ICodec*",
+        "notes": "CPU-intensive. Optional for forward-looking deployments. Encoder uses libaom with AOM_USAGE_REALTIME. Decoder uses dav1d for superior performance."
+      }
+    }
+  },
+
+  "directoryStructure": {
+    "description": "Proposed source tree layout",
+    "tree": {
+      "iora_codecs/": {
+        ".gitmodules": "Git submodule definitions for all external dependencies",
+        "CMakeLists.txt": "Top-level build — add_subdirectory/ExternalProject for submodules, build options per codec",
+        "cmake/": {
+          "SubmoduleTargets.cmake": "CMake wrappers for non-CMake submodules (autotools, Meson) via ExternalProject_Add",
+          "CodecModules.cmake": "Per-codec build enable/disable options"
+        },
+        "libs/": {
+          "iora/": "Git submodule — Iora framework",
+          "opus/": "Git submodule — libopus (CMake)",
+          "speexdsp/": "Git submodule — libspeexdsp (only resample.c compiled directly, no autotools/ExternalProject)",
+          "libg722/": "Git submodule — libg722 (compiled directly)",
+          "libilbc/": "Git submodule — libilbc (CMake, optional)",
+          "opencore-amr/": "Git submodule — opencore-amr (autotools, optional)",
+          "vo-amrwbenc/": "Git submodule — vo-amrwbenc (autotools, optional)",
+          "openh264/": "Git submodule — OpenH264 (Make/Meson)",
+          "libvpx/": "Git submodule — libvpx (configure/make)",
+          "libaom/": "Git submodule — libaom (CMake, optional)",
+          "dav1d/": "Git submodule — dav1d (Meson, optional)"
+        },
+        "include/iora/codecs/": {
+          "core/": ["media_buffer.hpp", "media_buffer_pool.hpp", "media_clock.hpp"],
+          "codec/": ["i_codec.hpp", "codec_info.hpp", "i_codec_factory.hpp", "codec_registry.hpp"],
+          "dsp/": ["resampler.hpp", "audio_mixer.hpp", "gain.hpp", "vad.hpp", "tone_generator.hpp", "goertzel_detector.hpp", "wav_writer.hpp", "wav_reader.hpp"],
+          "pipeline/": ["i_media_handler.hpp", "transcoding_handler.hpp", "audio_mixer_handler.hpp", "media_pipeline.hpp"],
+          "format/": ["sample_format.hpp", "pixel_format.hpp"]
+        },
+        "src/": {
+          "codec/": "CodecRegistry implementation",
+          "dsp/": "Resampler (wraps libspeexdsp), AudioMixer — header-only DSP components (Gain, VAD, ToneGenerator, GoertzelDetector, WavWriter, WavReader) have no .cpp files",
+          "pipeline/": "TranscodingHandler, AudioMixerHandler, MediaPipeline implementations"
+        },
+        "modules/": {
+          "opus/": "iora_codec_opus plugin (links libopus)",
+          "g711/": "iora_codec_g711 plugin (built-in)",
+          "g722/": "iora_codec_g722 plugin",
+          "ilbc/": "iora_codec_ilbc plugin",
+          "amr/": "iora_codec_amr plugin (links opencore-amr)",
+          "h264/": "iora_codec_h264 plugin (links OpenH264)",
+          "vpx/": "iora_codec_vpx plugin (links libvpx)",
+          "av1/": "iora_codec_av1 plugin (links libaom/dav1d)"
+        },
+        "tests/": {
+          "core/": "Core abstraction tests (SampleFormat, PixelFormat, CodecInfo, MediaBuffer, MediaClock, CodecRegistry)",
+          "codec/": "Per-codec encode/decode round-trip tests and plugin integration tests",
+          "dsp/": "DSP utility tests (Resampler, Gain, VAD, ToneGenerator, GoertzelDetector, WavWriter, WavReader, integration)",
+          "pipeline/": "End-to-end pipeline tests (e.g., Opus→G.711 transcode)"
+        },
+        "docs/": {
+          "architecture.json": "This document"
+        }
+      }
+    }
+  },
+
+  "buildConfiguration": {
+    "cmakeOptions": {
+      "IORA_CODECS_ENABLE_OPUS": {"default": "ON", "description": "Build Opus codec module"},
+      "IORA_CODECS_ENABLE_G711": {"default": "ON", "description": "Build G.711 codec module (always recommended)"},
+      "IORA_CODECS_ENABLE_G722": {"default": "ON", "description": "Build G.722 codec module"},
+      "IORA_CODECS_ENABLE_ILBC": {"default": "ON", "description": "Build iLBC codec module"},
+      "IORA_CODECS_ENABLE_AMR": {"default": "OFF", "description": "Build AMR codec module (patent encumbered — Via Licensing patent license is effectively mandatory for commercial deployment, not optional. Default OFF to avoid legal risk for developers unaware of the licensing requirement)"},
+      "IORA_CODECS_ENABLE_H264": {"default": "ON", "description": "Build H.264 codec module (OpenH264)"},
+      "IORA_CODECS_ENABLE_VPX": {"default": "ON", "description": "Build VP8/VP9 codec module"},
+      "IORA_CODECS_ENABLE_AV1": {"default": "OFF", "description": "Build AV1 codec module"},
+      "IORA_CODECS_STATIC_PLUGINS": {"default": "OFF", "description": "(NOT YET IMPLEMENTED — design placeholder) Link codec modules statically instead of as runtime-loadable plugins. Useful for embedded/single-binary deployments."},
+      "IORA_CODECS_BUILD_TESTS": {"default": "ON", "description": "Build test executables"},
+      "IORA_CODECS_BUILD_EXAMPLES": {"default": "OFF", "description": "Build example programs"}
+    },
+    "minimumDependencies": {
+      "description": "A minimal build requires only: Iora + libopus + libspeexdsp + G.711 (built-in). All other codecs (G.722, iLBC, H.264, VP8/VP9) are ON by default; AMR and AV1 are OFF by default. Each can be individually enabled/disabled. The 'mandatory' flag in codecModules indicates codecs recommended for production VoIP — not that they cannot be disabled.",
+      "absoluteMinimum": ["iora (framework)", "libopus (Opus codec)", "libspeexdsp (resampler)", "G.711 (built-in, no external dep)"]
+    }
+  },
+
+  "usageScenariosAndDataFlow": {
+    "_note_cross_library": "These scenarios span multiple libraries. Steps marked [iora_rtp] are handled by the companion iora_rtp library, [iora_io_device] by the device I/O library, and [iora_codecs] by this library. The boundaries: iora_rtp delivers encoded MediaBuffers to iora_codecs for decoding and receives encoded MediaBuffers back; iora_io_device delivers raw MediaBuffers (captured audio/video) and receives decoded MediaBuffers for playback.",
+    "scenario1_audio_transcode": {
+      "description": "Transcode between two audio codecs (e.g., Opus ↔ G.711) — the core SBC use case",
+      "dataFlow": [
+        "1. [iora_rtp] Transport library receives RTP packets → RtpPacket::parse() → JitterBuffer reorders and triggers playout",
+        "2. [iora_rtp] JitterBuffer delivers MediaBuffer (encoded payload) to TranscodingHandler",
+        "3. [iora_codecs] TranscodingHandler: OpusDecoder.decode() → PCM(48kHz)",
+        "4. [iora_codecs] TranscodingHandler: Resampler.process() → PCM(8kHz)",
+        "5. [iora_codecs] TranscodingHandler: G711Encoder.encode() → G.711 payload",
+        "6. [iora_rtp] RtpPacket::build() assembles outbound RTP bytes → returned to transport library for sending",
+        "7. Reverse path: G.711 → decode → resample(8kHz→48kHz) → Opus encode"
+      ]
+    },
+    "scenario2_audio_capture_encode": {
+      "description": "Capture audio from a device, encode, and deliver encoded frames to a transport library",
+      "dataFlow": [
+        "1. [iora_io_device] IAudioDevice (ALSA) captures PCM(48kHz, S16LE) from microphone",
+        "2. [iora_io_device] Device callback delivers MediaBuffer to pipeline",
+        "3. [iora_codecs] Pipeline routes through: VAD → Gain → OpusEncoder",
+        "4. [iora_codecs] Encoded MediaBuffer delivered via pipeline outgoing callback",
+        "5. Transport library (external) receives encoded frames for RTP packetization and sending"
+      ]
+    },
+    "scenario3_audio_decode_playback": {
+      "description": "Receive encoded audio from a transport library, decode, and play back on a device",
+      "dataFlow": [
+        "1. [iora_rtp] Transport library feeds encoded MediaBuffer → JitterBuffer reorders and schedules playout",
+        "2. [iora_codecs] OpusDecoder.decode() → PCM(48kHz, S16LE)",
+        "3. [iora_codecs] Gain adjustment if needed",
+        "4. [iora_io_device] IAudioDevice (ALSA) plays PCM on speaker"
+      ]
+    },
+    "scenario4_dtmf_relay": {
+      "description": "DTMF digit relay through the media pipeline — both RFC 4733 telephone-event and in-band tone detection/generation",
+      "dataFlow": [
+        "1. [iora_rtp] Inbound: Transport library passes RTP with PT=101 (telephone-event) to DtmfHandler",
+        "2. [iora_rtp] DtmfHandler decodes RFC 4733 payload → emits typed MediaEvent{DtmfDigit{digit, duration, volume}}",
+        "3. [iora_rtp] Pipeline routes event: if outbound codec supports telephone-event, re-encode as RFC 4733 on outbound RTP",
+        "4. [iora_codecs] If outbound codec does NOT support telephone-event, ToneGenerator generates in-band DTMF tones injected into the PCM pipeline",
+        "5. [iora_codecs] In-band detection (reverse): Goertzel detector monitors decoded PCM for DTMF tones → emits MediaEvent if detected"
+      ]
+    },
+    "scenario5_codec_change_midcall": {
+      "description": "Mid-call codec renegotiation (e.g., Opus → G.711 after SDP re-INVITE) without audible glitch",
+      "dataFlow": [
+        "1. Signaling library (external) completes SDP renegotiation, determines new codec",
+        "2. Signaling library calls MediaPipeline::swapCodec(direction, newCodecInfo)",
+        "3. Pipeline drains in-flight frames from old codec (ILifecycleManaged::Draining state)",
+        "4. Pipeline creates new encoder/decoder via CodecRegistry::createEncoder/createDecoder",
+        "5. If sample rates differ, Resampler is inserted/removed/reconfigured automatically",
+        "6. New codec enters Running state — seamless transition, no audible gap beyond one frame period"
+      ]
+    },
+    "scenario6_video_encode_decode": {
+      "description": "Capture video from a device, encode with H.264, and decode received H.264 for display",
+      "dataFlow": [
+        "1. [iora_io_device] IVideoDevice (V4L2) captures I420 frames from camera",
+        "2. [iora_codecs] H264Encoder.encode() → H.264 NAL units in MediaBuffer",
+        "3. [iora_codecs] Encoded MediaBuffer delivered via pipeline outgoing callback to transport library",
+        "4. Receive path: transport library feeds H.264 NAL units into pipeline",
+        "5. [iora_codecs] H264Decoder.decode() → I420 frames",
+        "6. [iora_io_device] IVideoDevice display renders decoded frames"
+      ]
+    },
+    "scenario7_audio_conference": {
+      "description": "N-way audio conference where each participant hears a mix of all OTHER participants (N-1 mix semantics)",
+      "dataFlow": [
+        "1. [iora_rtp] Each participant's RTP stream → JitterBuffer reorders and triggers playout",
+        "2. [iora_codecs] Per-participant TranscodingHandler decodes and resamples to common rate (e.g., 16 kHz mono PCM)",
+        "3. [iora_codecs] AudioMixerHandler.incoming(buffer) — identifies participant by SSRC, buffers the frame",
+        "4. [iora_codecs] When all active participants have contributed a frame, AudioMixer produces N-1 mixes (participant A hears B+C, B hears A+C, C hears A+B) using efficient subtract-from-total algorithm",
+        "5. [iora_codecs] Each participant's N-1 mix output is forwarded to their downstream TranscodingHandler for re-encoding to the participant's outbound codec",
+        "6. [iora_rtp] RtpPacketBuilder packetizes encoded output for each participant"
+      ],
+      "designNotes": [
+        "Upstream decode pipelines (step 2) are per-participant linear IMediaHandler chains feeding into the shared AudioMixerHandler",
+        "Downstream encode pipelines (step 5) are per-participant linear chains routed by AudioMixerHandler's participant→outputHandler map",
+        "All participants normalized to same sample rate BEFORE mixing — Resampler instances live in upstream TranscodingHandlers, not in the mixer itself",
+        "MediaBufferPool shared across all participants — sized for (maxParticipants × 2 frames) + headroom"
+      ]
+    },
+    "scenario8_call_recording": {
+      "description": "Record audio from a live call to a WAV file — passive tap that does not modify the media stream",
+      "dataFlow": [
+        "1. [iora_rtp] RTP stream → JitterBuffer → playout",
+        "2. [iora_codecs] TranscodingHandler decodes to S16 PCM",
+        "3. [iora_codecs] WavRecorderHandler taps the pipeline — writes S16 PCM to .wav file AND forwards buffer unchanged",
+        "4. [iora_codecs] Downstream stages (Gain, VAD, etc.) receive unmodified audio — recording is transparent",
+        "5. On call end or recording stop: WavRecorderHandler.stopRecording() finalizes WAV header with correct data sizes"
+      ],
+      "designNotes": [
+        "WavRecorderHandler is a passive tap — it inserts anywhere in the pipeline without affecting audio processing",
+        "RecordDirection enum controls which direction(s) to capture: INCOMING (remote audio), OUTGOING (local audio), or BOTH",
+        "BOTH mode interleaves into a single mono file (dual-file mode is a future enhancement)",
+        "Recording can be started/stopped mid-call via startRecording()/stopRecording()",
+        "If the process crashes without calling close(), the WAV file is still playable by most applications that tolerate incorrect size headers"
+      ]
+    }
+  },
+
+  "testingStrategy": {
+    "unitTests": [
+      "Codec round-trip: encode(decode(original)) == original (within lossy codec tolerance)",
+      "Resampler: rate conversion accuracy (48kHz→8kHz→48kHz), quality levels, stereo, edge cases",
+      "MediaBuffer: pool allocation, reference counting, metadata preservation",
+      "Core abstractions: SampleFormat, PixelFormat, CodecInfo, MediaClock",
+      "Gain: unity/double/half/zero gain, saturation clamping, dB conversion, mute/unmute, NaN/infinity rejection",
+      "VAD: silence/speech detection, threshold sensitivity, hangover logic, RMS/peak calculation, reset, DROP_SILENT/MARK_ONLY modes",
+      "ToneGenerator: buffer sizing, amplitude scaling, all 16 DTMF digits, frequency verification via Goertzel, sample rates, sequences",
+      "GoertzelDetector: all 16 digits, silence/noise rejection, twist limits, duration tracking, minimum duration enforcement, sample rates",
+      "WavWriter: header correctness, streaming writes, close/finalize, duration tracking, odd-byte rejection, large file support",
+      "WavReader: header parsing, full/partial reads, seek, format validation, chunk skipping, EOF handling"
+    ],
+    "_note_rtp_tests": "RTP/RTCP, JitterBuffer, DtmfHandler, and RingBuffer tests belong in the iora_rtp library test suite.",
+    "integrationTests": [
+      "TranscodingHandler: Opus↔G.711 end-to-end with reference audio file comparison",
+      "AudioMixerHandler: N-way conference mixing with N-1 output verification per participant",
+      "Full pipeline: encode→decode loopback with reference audio comparison",
+      "DSP pipeline: VAD→Gain, ToneGenerator→GoertzelDetector round-trip, multi-stage VAD+Gain+Goertzel",
+      "WavWriter→WavReader round-trip: write PCM to WAV, read back, verify sample-exact match",
+      "WavRecorderHandler in pipeline: verify recording captures audio without modifying downstream output"
+    ],
+    "performanceBenchmarks": [
+      "Codec latency: measure encode+decode time per frame for each codec at target sample rate (must be < 50% of frame duration for real-time)",
+      "Pipeline throughput: frames/second through full transcode pipeline (Opus→G.711 and H.264→VP8)",
+      "Memory allocation: verify zero heap allocations in steady-state hot path (after pool warmup)",
+      "Resampler: CPU cost per second of audio at various quality levels (0-10)"
+    ],
+    "framework": "Catch2 (matching Iora's test framework)"
+  },
+
+  "companionLibraries": {
+    "iora_rtp": {
+      "description": "RTP framing, jitter buffering, DTMF, and comfort noise — companion library to iora_codecs. Handles RTP packet parsing/building (RFC 3550), RTCP (RFC 3550/4585), header extensions (RFC 5285), JitterBuffer, DtmfHandler (RFC 4733), and ComfortNoiseHandler (RFC 3389). Depends on iora_codecs_core for shared types (MediaBuffer, CodecInfo, MediaClock). No codec modules depend on iora_rtp.",
+      "repository": "/workspace/iora_rtp",
+      "dependsOn": ["iora (framework)", "iora_codecs_core (shared types)"],
+      "components": {
+        "RtpPacket": "RFC 3550 RTP packet parsing/building with RFC 5285 header extensions",
+        "RtcpPacket": "RFC 3550/4585 RTCP compound packet parsing/building (SR, RR, SDES, BYE, NACK, PLI)",
+        "JitterBuffer": "Adaptive jitter buffer for RTP packet reordering and playout scheduling",
+        "DtmfHandler": "RFC 4733 telephone-event RTP payload generation and detection",
+        "ComfortNoiseHandler": "RFC 3389 comfort noise generation and processing"
+      },
+      "rationale": "RTP is a transport framing protocol, not a codec concern. Separating it: (1) keeps iora_codecs focused on encode/decode/DSP, (2) allows iora_rtp to be used independently (e.g., RTP proxy/relay without codecs), (3) provides a natural home for future transport features (SRTP, DTLS, RED, FEC), (4) maintains a clean dependency graph where codec modules never depend on RTP."
+    },
+    "iora_io_device": {
+      "description": "Audio/video device I/O — capture and playback hardware abstraction. Platform-specific drivers (ALSA, PulseAudio, PipeWire, V4L2, CoreAudio, WASAPI) loaded as plugins. Depends on iora_codecs_core for shared types (MediaBuffer, SampleFormat, PixelFormat).",
+      "repository": "/workspace/iora_io_device",
+      "dependsOn": ["iora (framework)", "iora_codecs_core (shared types)"],
+      "components": {
+        "IAudioDevice": "Abstract interface for audio capture and playback devices with ILifecycleManaged lifecycle",
+        "IVideoDevice": "Abstract interface for video capture and display devices",
+        "DeviceManager": "Device enumeration, hot-plug detection, default device selection",
+        "AlsaAudioDevice": "ALSA audio driver plugin (Linux)",
+        "PulseAudioDevice": "PulseAudio driver plugin (Linux)",
+        "V4L2VideoDevice": "V4L2 video capture driver plugin (Linux)"
+      },
+      "rationale": "Device I/O is platform-specific hardware abstraction, not a codec concern. Separating it: (1) keeps iora_codecs focused on encode/decode/DSP, (2) allows iora_io_device to be used independently for audio/video capture without codecs, (3) isolates platform-specific code (ALSA, PulseAudio, V4L2) from the portable codec library, (4) future platform drivers (PipeWire, CoreAudio, WASAPI) extend iora_io_device without touching iora_codecs."
+    },
+    "iora_webrtc": {
+      "description": "WebRTC integration — libdatachannel bridge with adapter wrapping IMediaHandler as rtc::MediaHandler",
+      "status": "future"
+    }
+  },
+
+  "futureConsiderations": [
+    "iora_rtp transport extensions: SRTP/DTLS-SRTP session management, built on Iora's UnifiedSharedTransport",
+    "RED (RFC 2198) — Redundant Audio Data for packet loss recovery in iora_rtp. Near-term priority: RED is widely used in WebRTC for Opus.",
+    "FlexFEC (RFC 8627) — Flexible Forward Error Correction for video streams in iora_rtp.",
+    "RTP header extensions (RFC 5285) — specific extension type parsers in iora_rtp: abs-send-time, audio level indication (RFC 6464), mid/rid for simulcast.",
+    "Hardware codec acceleration (VAAPI, NVENC, V4L2 M2M for video encode/decode)",
+    "Acoustic echo cancellation (AEC) using libspeexdsp or WebRTC AEC3",
+    "Noise suppression (NS) using RNNoise or libspeexdsp",
+    "Automatic gain control (AGC)",
+    "Conference mixing enhancements: dominant speaker detection, VAD-based silence exclusion, AGC normalization — builds on AudioMixer/AudioMixerHandler",
+    "Simulcast and SVC layer selection for video",
+    "Bandwidth estimation (TWCC-based) for adaptive bitrate — requires abs-send-time RTP header extension in iora_rtp",
+    "RTCP Extended Reports (RFC 3611) for VoIP quality metrics (MOS estimation) in iora_rtp",
+    "EVS codec support if open-source implementation becomes available",
+    "PipeWire audio device driver for modern Linux desktops (in iora_io_device)",
+    "macOS CoreAudio and Windows WASAPI device drivers (in iora_io_device)"
+  ]
+}

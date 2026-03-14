@@ -1,0 +1,33 @@
+[submodule "libs/iora"]
+	path = libs/iora
+	url = https://github.com/joegen/iora.git
+[submodule "libs/opus"]
+	path = libs/opus
+	url = https://github.com/xiph/opus.git
+[submodule "libs/speexdsp"]
+	path = libs/speexdsp
+	url = https://github.com/xiph/speexdsp.git
+[submodule "libs/libg722"]
+	path = libs/libg722
+	url = https://github.com/sippy/libg722.git
+[submodule "libs/libilbc"]
+	path = libs/libilbc
+	url = https://github.com/TimothyGu/libilbc.git
+[submodule "libs/opencore-amr"]
+	path = libs/opencore-amr
+	url = https://github.com/BelledonneCommunications/opencore-amr.git
+[submodule "libs/vo-amrwbenc"]
+	path = libs/vo-amrwbenc
+	url = https://github.com/BelledonneCommunications/vo-amrwbenc.git
+[submodule "libs/openh264"]
+	path = libs/openh264
+	url = https://github.com/cisco/openh264.git
+[submodule "libs/libvpx"]
+	path = libs/libvpx
+	url = https://chromium.googlesource.com/webm/libvpx.git
+[submodule "libs/libaom"]
+	path = libs/libaom
+	url = https://aomedia.googlesource.com/aom.git
+[submodule "libs/dav1d"]
+	path = libs/dav1d
+	url = https://code.videolan.org/videolan/dav1d.git

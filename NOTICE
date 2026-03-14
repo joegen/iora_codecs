@@ -1,0 +1,92 @@
+iora_codecs
+Copyright 2024-2026 Joegen Baclor
+
+This product includes software developed by third parties.
+See below for attribution and license details.
+
+================================================================================
+
+Iora Framework
+  Copyright 2024-2026 Joegen Baclor
+  License: Mozilla Public License 2.0
+  https://github.com/joegen/iora
+
+================================================================================
+
+Opus
+  Copyright 2001-2023 Xiph.Org Foundation, Skype Limited,
+  Octasic Inc., Jean-Marc Valin, Timothy B. Terriberry, CSIRO,
+  Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo
+  License: BSD-3-Clause
+  https://opus-codec.org
+
+================================================================================
+
+SpeexDSP (resampler only)
+  Copyright 2002-2008 Jean-Marc Valin
+  Copyright 2002-2008 Xiph.org Foundation
+  License: BSD-3-Clause
+  https://www.speex.org
+
+================================================================================
+
+libG722
+  Copyright 1993 Carnegie Mellon University
+  Copyright 2005 Steve Underwood
+  Copyright 2014-2025 Sippy Software, Inc.
+  License: BSD-3-Clause
+  https://github.com/sippy/libg722
+
+================================================================================
+
+libilbc (Internet Low Bitrate Codec)
+  Copyright The WebRTC project authors
+  License: BSD-3-Clause
+  https://github.com/nicktimko/libilbc
+
+================================================================================
+
+opencore-amr
+  Copyright The Android Open Source Project
+  License: Apache License 2.0
+  https://github.com/BelledonneCommunications/opencore-amr
+
+================================================================================
+
+vo-amrwbenc
+  Copyright The Android Open Source Project
+  License: Apache License 2.0
+  https://github.com/BelledonneCommunications/vo-amrwbenc
+
+================================================================================
+
+OpenH264
+  Copyright 2013-2024 Cisco Systems, Inc.
+  License: BSD-2-Clause
+  https://www.openh264.org
+
+================================================================================
+
+libvpx (VP8/VP9)
+  Copyright The WebM Project Authors
+  License: BSD-3-Clause
+  https://www.webmproject.org
+
+================================================================================
+
+libaom (AV1 encoder)
+  Copyright Alliance for Open Media
+  License: BSD-2-Clause
+  https://aomedia.org
+
+================================================================================
+
+dav1d (AV1 decoder)
+  Copyright VideoLAN and dav1d authors
+  License: BSD-2-Clause
+  https://code.videolan.org/videolan/dav1d
+
+================================================================================
+
+All third-party libraries use permissive licenses (BSD-2-Clause, BSD-3-Clause,
+or Apache-2.0) compatible with the Mozilla Public License 2.0.
