@@ -119,11 +119,32 @@ iora_codecs/
     dsp/            Resampler, AudioMixer, Gain, VAD, ToneGenerator, Goertzel, WAV
     pipeline/       IMediaHandler, TranscodingHandler, AudioMixerHandler, MediaPipeline
   src/              Implementation files
-  modules/          Codec plugins (opus, g711, g722, ilbc, amr, h264, vpx, av1)
+  modules/          Registry and codec plugins (registry, opus, g711, g722, ilbc, amr, h264, vpx, av1)
   tests/            Unit and integration tests
   libs/             Third-party submodules
   docs/             Architecture document and programmer's manual
 ```
+
+## Quick Start
+
+```cpp
+#include <iora/iora.hpp>
+#include <iora/codecs/codec/codec_registry.hpp>
+
+// Initialize Iora and load plugins
+auto& svc = iora::IoraService::instanceRef();
+svc.loadSingleModule("mod_registry.so");  // load registry first
+svc.loadSingleModule("mod_opus.so");      // auto-registers with registry
+svc.loadSingleModule("mod_g711.so");      // auto-registers PCMU + PCMA
+
+// Create codecs via the registry
+auto& registry = svc.callExportedApi<iora::codecs::CodecRegistry&>("codecs.registry");
+auto opusInfo = registry.findByName("opus");
+auto encoder = registry.createEncoder(*opusInfo);
+auto decoder = registry.createDecoder(*opusInfo);
+```
+
+See the [Programmer's Manual](docs/programmers_manual.md) for pipeline construction, DSP processing, and integration patterns.
 
 ## Documentation
 

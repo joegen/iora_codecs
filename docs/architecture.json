@@ -371,7 +371,7 @@
           "findByPayloadType(pt)": "Find codec by RTP payload type",
           "_note_no_negotiate": "SDP codec negotiation is explicitly NOT part of CodecRegistry — it belongs in the signaling library. Signaling libraries use enumerateCodecs/findByName/findByPayloadType to query available codecs and perform their own offer/answer intersection with full SDP context."
         },
-        "notes": "Singleton owned by the iora_codecs host library and accessed through IoraService exported APIs — NOT through a static CodecRegistry::instance() call. The host library creates the single CodecRegistry and exports it via service->exportApi(). Codec plugins access it through their IoraService* pointer: service->callExportedApi<void, ICodecFactory*>('codecs.registerFactory', factory.get()). This avoids issues with static singletons in header-only libraries where each .so gets its own instance. External libraries query available codecs the same way — these are infrequent setup-time operations, so callExportedApi is appropriate (e.g., service.callExportedApi<std::vector<CodecInfo>>('codecs.enumerateCodecs')). Codec creation is also infrequent: service.callExportedApi<ICodec*, const CodecInfo&>('codecs.createEncoder', info). The ICodec* returned from createEncoder/createDecoder is then used directly via C++ virtual dispatch for the hot path (encode/decode/plc) — these per-frame calls never go through the exported API system."
+        "notes": "Owned by the mod_registry Iora plugin module (modules/registry/mod_registry.cpp). The host application loads mod_registry first, which creates the CodecRegistry and exports it as 'codecs.registry'. Codec plugins access it in onLoad() via service->callExportedApi<CodecRegistry&>('codecs.registry') and call registerFactory() to auto-register. If mod_registry is not loaded, codec modules still function — their factories are accessible via per-module exported APIs (e.g., 'g711.pcmu.factory', 'opus.factory') — but they will not appear in the central registry. mod_registry also exports convenience APIs: 'codecs.registry.enumerate', 'codecs.registry.findByName', and 'codecs.registry.findByPayloadType'. The ICodec* returned from createEncoder/createDecoder is used directly via C++ virtual dispatch for the hot path (encode/decode/plc) — per-frame calls never go through the exported API system."
       }
     },
 
@@ -978,6 +978,7 @@
           "pipeline/": "TranscodingHandler, AudioMixerHandler, MediaPipeline implementations"
         },
         "modules/": {
+          "registry/": "mod_registry plugin — owns and exports the central CodecRegistry; must be loaded before codec modules",
           "opus/": "iora_codec_opus plugin (links libopus)",
           "g711/": "iora_codec_g711 plugin (built-in)",
           "g722/": "iora_codec_g722 plugin",

@@ -401,15 +401,40 @@ public:
 };
 ```
 
-The registry is not a singleton — it is created by the host library and exported via `IoraService::exportApi()`. Codec plugins access it through their `IoraService*` pointer:
+The registry is not a singleton — it lives inside the `mod_registry` Iora plugin module. Load `mod_registry` before any codec modules so they can auto-register their factories:
 
 ```cpp
-// Plugin registration
-service->callExportedApi<void, ICodecFactory*>("codecs.registerFactory", factory.get());
-
-// Query available codecs
-auto codecs = service->callExportedApi<std::vector<CodecInfo>>("codecs.enumerateCodecs");
+// Host application startup — load registry first, then codecs
+auto& svc = iora::IoraService::instanceRef();
+svc.loadSingleModule("mod_registry.so");   // exports "codecs.registry"
+svc.loadSingleModule("mod_g711.so");       // auto-registers PCMU + PCMA
+svc.loadSingleModule("mod_opus.so");       // auto-registers opus
+// ... load additional codec modules as needed
 ```
+
+Once loaded, the registry is accessible via the exported API:
+
+```cpp
+// Retrieve the registry from any plugin or host code
+auto& registry = svc.callExportedApi<CodecRegistry&>("codecs.registry");
+
+// Look up and create codecs
+auto info = registry.findByName("opus");
+auto encoder = registry.createEncoder(*info);
+auto decoder = registry.createDecoder(*info);
+
+// Enumerate all registered codecs
+auto allCodecs = registry.enumerateCodecs();
+
+// Convenience APIs exported directly by mod_registry
+auto codecs = svc.callExportedApi<std::vector<CodecInfo>>("codecs.registry.enumerate");
+auto pcmu = svc.callExportedApi<std::optional<CodecInfo>>(
+  "codecs.registry.findByName", std::string("PCMU"));
+auto pt0 = svc.callExportedApi<std::optional<CodecInfo>>(
+  "codecs.registry.findByPayloadType", static_cast<std::uint8_t>(0));
+```
+
+Each codec module's `onLoad()` calls `service->callExportedApi<CodecRegistry&>("codecs.registry")` and registers its factory automatically. If `mod_registry` is not loaded, the codec module still works — its factory is accessible via its own exported API (e.g., `"g711.pcmu.factory"`, `"opus.factory"`), but it will not appear in the central registry.
 
 ### Codec Modules
 
