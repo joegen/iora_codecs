@@ -29,7 +29,7 @@ public:
       [this]() -> std::vector<CodecInfo> { return _registry->enumerateCodecs(); });
 
     service->exportApi(*this, "codecs.registry.findByName",
-      [this](const std::string& name) -> std::optional<CodecInfo> {
+      [this](std::string name) -> std::optional<CodecInfo> {
         return _registry->findByName(name);
       });
 

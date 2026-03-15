@@ -29,6 +29,31 @@ include(Catch)
 catch_discover_tests(core_tests)
 
 # ==========================================================================
+# Registry + G.711 plugin integration test (loads mod_registry then mod_g711)
+# ==========================================================================
+if(IORA_CODECS_ENABLE_G711)
+  find_package(OpenSSL REQUIRED)
+  find_package(Threads REQUIRED)
+  add_executable(registry_plugin_tests
+    codec/test_registry_plugin.cpp
+  )
+  target_link_libraries(registry_plugin_tests PRIVATE
+    iora_codecs_core
+    iora_lib
+    Catch2::Catch2WithMain
+    OpenSSL::SSL OpenSSL::Crypto
+    ${CMAKE_DL_LIBS}
+    Threads::Threads
+  )
+  target_include_directories(registry_plugin_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+  )
+  add_dependencies(registry_plugin_tests mod_registry mod_g711)
+  catch_discover_tests(registry_plugin_tests)
+endif()
+
+# ==========================================================================
 # G.711 codec unit tests (Catch2)
 # ==========================================================================
 if(IORA_CODECS_ENABLE_G711)
