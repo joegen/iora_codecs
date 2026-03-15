@@ -29,7 +29,7 @@ include(Catch)
 catch_discover_tests(core_tests)
 
 # ==========================================================================
-# Registry + G.711 plugin integration test (loads mod_registry then mod_g711)
+# Registry + G.711 plugin integration test (loads mod_codec_registry then mod_g711)
 # ==========================================================================
 if(IORA_CODECS_ENABLE_G711)
   find_package(OpenSSL REQUIRED)
@@ -49,7 +49,7 @@ if(IORA_CODECS_ENABLE_G711)
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/include"
   )
-  add_dependencies(registry_plugin_tests mod_registry mod_g711)
+  add_dependencies(registry_plugin_tests mod_codec_registry mod_g711)
   catch_discover_tests(registry_plugin_tests)
 endif()
 

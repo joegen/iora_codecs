@@ -43,7 +43,7 @@ void shutdownService()
   }
 }
 
-/// Initializes IoraService, loads mod_registry, then loads mod_g711.
+/// Initializes IoraService, loads mod_codec_registry, then loads mod_g711.
 iora::IoraService& ensurePluginsLoaded()
 {
   static bool initialized = false;
@@ -61,10 +61,10 @@ iora::IoraService& ensurePluginsLoaded()
     auto& svc = iora::IoraService::instanceRef();
 
     // Load registry first
-    auto registryPath = findPluginPath("registry");
+    auto registryPath = findPluginPath("codec_registry");
     if (registryPath.empty() || !svc.loadSingleModule(registryPath))
     {
-      throw std::runtime_error("Failed to load mod_registry.so from: " + registryPath);
+      throw std::runtime_error("Failed to load mod_codec_registry.so from: " + registryPath);
     }
 
     // Load G.711 codec — should auto-register with the registry

@@ -1,7 +1,7 @@
 # modules/CMakeLists.txt — Router for codec module subdirectories.
 
 # Registry must be loaded before any codec modules.
-add_subdirectory(registry)
+add_subdirectory(codec_registry)
 
 if(IORA_CODECS_ENABLE_G711)
   add_subdirectory(g711)

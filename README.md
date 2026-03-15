@@ -133,7 +133,7 @@ iora_codecs/
 
 // Initialize Iora and load plugins
 auto& svc = iora::IoraService::instanceRef();
-svc.loadSingleModule("mod_registry.so");  // load registry first
+svc.loadSingleModule("mod_codec_registry.so");  // load registry first
 svc.loadSingleModule("mod_opus.so");      // auto-registers with registry
 svc.loadSingleModule("mod_g711.so");      // auto-registers PCMU + PCMA
 

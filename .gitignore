@@ -1,5 +1,6 @@
 # Build directories
 build/
+Testing/
 build-*/
 cmake-build-*/
 
