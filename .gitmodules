@@ -31,3 +31,6 @@
 [submodule "libs/dav1d"]
 	path = libs/dav1d
 	url = https://code.videolan.org/videolan/dav1d.git
+[submodule "libs/bcg729"]
+	path = libs/bcg729
+	url = https://github.com/BelledonneCommunications/bcg729.git

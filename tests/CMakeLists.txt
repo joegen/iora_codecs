@@ -442,6 +442,45 @@ target_include_directories(media_pipeline_tests PRIVATE "${CMAKE_CURRENT_SOURCE_
 catch_discover_tests(media_pipeline_tests)
 
 # ==========================================================================
+# G.729 codec unit tests (Catch2) — GPL-3.0 (links bcg729)
+# ==========================================================================
+if(IORA_CODECS_ENABLE_G729)
+  add_executable(g729_tests
+    codec/test_g729_codec.cpp
+    "${CMAKE_SOURCE_DIR}/modules/g729/g729_codec.cpp"
+    "${CMAKE_SOURCE_DIR}/modules/g729/g729_codec_factory.cpp"
+  )
+  target_link_libraries(g729_tests PRIVATE iora_codecs_core bcg729-static Catch2::Catch2WithMain)
+  target_include_directories(g729_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/modules"
+    "${CMAKE_SOURCE_DIR}/libs/bcg729/include"
+  )
+  catch_discover_tests(g729_tests)
+
+  # G.729 plugin integration test (loads .so via IoraService)
+  find_package(OpenSSL REQUIRED)
+  find_package(Threads REQUIRED)
+  add_executable(g729_plugin_tests
+    codec/test_g729_plugin.cpp
+  )
+  target_link_libraries(g729_plugin_tests PRIVATE
+    iora_codecs_core
+    iora_lib
+    Catch2::Catch2WithMain
+    OpenSSL::SSL OpenSSL::Crypto
+    ${CMAKE_DL_LIBS}
+    Threads::Threads
+  )
+  target_include_directories(g729_plugin_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+  )
+  add_dependencies(g729_plugin_tests mod_g729)
+  catch_discover_tests(g729_plugin_tests)
+endif()
+
+# ==========================================================================
 # Build smoke test (submodule linkage verification)
 # ==========================================================================
 
@@ -492,6 +531,12 @@ if(IORA_CODECS_ENABLE_AV1)
   target_compile_definitions(build_smoke_test PRIVATE IORA_CODECS_ENABLE_AV1)
   target_link_libraries(build_smoke_test PRIVATE aom dav1d pthread)
   target_include_directories(build_smoke_test PRIVATE "${CMAKE_BINARY_DIR}/external/include")
+endif()
+
+if(IORA_CODECS_ENABLE_G729)
+  target_compile_definitions(build_smoke_test PRIVATE IORA_CODECS_ENABLE_G729)
+  target_link_libraries(build_smoke_test PRIVATE bcg729-static)
+  target_include_directories(build_smoke_test PRIVATE "${CMAKE_SOURCE_DIR}/libs/bcg729/include")
 endif()
 
 if(IORA_CODECS_ENABLE_G711)

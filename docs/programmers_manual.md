@@ -64,6 +64,7 @@ cd build && ctest --output-on-failure
 | `IORA_CODECS_ENABLE_AMR` | OFF | AMR-NB/WB (patent encumbered) |
 | `IORA_CODECS_ENABLE_H264` | ON | H.264 (OpenH264) |
 | `IORA_CODECS_ENABLE_VPX` | ON | VP8/VP9 |
+| `IORA_CODECS_ENABLE_G729` | OFF | G.729 (GPL-3.0, opt-in) |
 | `IORA_CODECS_ENABLE_AV1` | OFF | AV1 (needs meson + ninja) |
 | `IORA_CODECS_BUILD_TESTS` | ON | Build test executables |
 | `IORA_CODECS_BUILD_EXAMPLES` | OFF | Build example programs |
@@ -445,6 +446,7 @@ Each codec module's `onLoad()` calls `service->callExportedApi<CodecRegistry&>("
 | G.711 A-law | PCMA | 8 | 8000 | Built-in | — | `ENABLE_G711` |
 | G.722 | G722 | 9 | 8000* | BSD-2 | — | `ENABLE_G722` |
 | iLBC | iLBC | dynamic | 8000 | BSD-3 | PLC | `ENABLE_ILBC` |
+| G.729 | G729 | 18 | 8000 | GPL-3.0* | PLC, CBR | `ENABLE_G729` |
 | AMR-NB | AMR | dynamic | 8000 | Apache-2.0 | DTX | `ENABLE_AMR` |
 | AMR-WB | AMR-WB | dynamic | 16000 | Apache-2.0 | DTX | `ENABLE_AMR` |
 | H.264 | H264 | dynamic | 90000 | BSD-2 | SVC | `ENABLE_H264` |
@@ -453,6 +455,8 @@ Each codec module's `onLoad()` calls `service->callExportedApi<CodecRegistry&>("
 | AV1 | AV1 | dynamic | 90000 | BSD-2 | SVC | `ENABLE_AV1` |
 
 *G.722 uses RTP clock rate 8000 per RFC 3551 despite 16kHz audio bandwidth.
+
+*G.729 uses bcg729 (GPL-3.0). GPL scope confined to mod_g729.so via RTLD_LOCAL.
 
 **Opus parameters:** `setParameter("bitrate", value)`, `setParameter("complexity", 0-10)`, `setParameter("fec", 0|1)`, `setParameter("dtx", 0|1)`.
 
@@ -1730,10 +1734,13 @@ All conversions route through S16 as the hub format.
 | iLBC | BSD-3 | dynamic | 8000 | PLC | `ENABLE_ILBC` | ON |
 | AMR-NB | Apache-2.0 | dynamic | 8000 | DTX | `ENABLE_AMR` | OFF |
 | AMR-WB | Apache-2.0 | dynamic | 16000 | DTX | `ENABLE_AMR` | OFF |
+| G.729 | GPL-3.0* | 18 | 8000 | PLC, CBR | `ENABLE_G729` | OFF |
 | H.264 | BSD-2 | dynamic | 90000 | SVC | `ENABLE_H264` | ON |
 | VP8 | BSD-3 | dynamic | 90000 | — | `ENABLE_VPX` | ON |
 | VP9 | BSD-3 | dynamic | 90000 | SVC | `ENABLE_VPX` | ON |
 | AV1 | BSD-2 | dynamic | 90000 | SVC | `ENABLE_AV1` | OFF |
+
+*G.729 uses bcg729 (GPL-3.0). GPL scope confined to mod_g729.so via RTLD_LOCAL.
 
 ### Appendix F: Future Features (Not Yet Implemented)
 

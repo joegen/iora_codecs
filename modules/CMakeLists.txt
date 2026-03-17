@@ -23,6 +23,10 @@ if(IORA_CODECS_ENABLE_AMR)
   add_subdirectory(amr)
 endif()
 
+if(IORA_CODECS_ENABLE_G729)
+  add_subdirectory(g729)
+endif()
+
 if(IORA_CODECS_ENABLE_H264)
   add_subdirectory(h264)
 endif()

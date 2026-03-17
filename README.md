@@ -13,6 +13,9 @@ General-purpose audio and video codec library for media encoding, decoding, and 
 | G.722 | 16 kHz | 48/56/64 kbps | BSD-3 | ON |
 | iLBC | 8 kHz | 13.3/15.2 kbps | BSD-3 | ON |
 | AMR-NB/WB | 8/16 kHz | 4.75-23.85 kbps | Apache-2.0 | OFF |
+| G.729 | 8 kHz | 8 kbps | GPL-3.0* | OFF |
+
+*G.729 (mod_g729.so) uses bcg729 (GPL-3.0). GPL scope is confined to this module via RTLD_LOCAL isolation. Opt-in: -DIORA_CODECS_ENABLE_G729=ON
 
 ### Video Codecs
 
@@ -96,6 +99,7 @@ cmake --build build -j$(nproc)
 | `IORA_CODECS_ENABLE_AMR` | OFF | AMR-NB/WB (patent encumbered) |
 | `IORA_CODECS_ENABLE_H264` | ON | H.264 via OpenH264 |
 | `IORA_CODECS_ENABLE_VPX` | ON | VP8/VP9 via libvpx |
+| `IORA_CODECS_ENABLE_G729` | OFF | G.729 via bcg729 (GPL-3.0, isolated) |
 | `IORA_CODECS_ENABLE_AV1` | OFF | AV1 (requires meson + ninja) |
 
 ## Testing
@@ -119,7 +123,7 @@ iora_codecs/
     dsp/            Resampler, AudioMixer, Gain, VAD, ToneGenerator, Goertzel, WAV
     pipeline/       IMediaHandler, TranscodingHandler, AudioMixerHandler, MediaPipeline
   src/              Implementation files
-  modules/          Registry and codec plugins (registry, opus, g711, g722, ilbc, amr, h264, vpx, av1)
+  modules/          Registry and codec plugins (registry, opus, g711, g722, ilbc, amr, g729, h264, vpx, av1)
   tests/            Unit and integration tests
   libs/             Third-party submodules
   docs/             Architecture document and programmer's manual
@@ -156,4 +160,4 @@ See the [Programmer's Manual](docs/programmers_manual.md) for pipeline construct
 
 This project is licensed under the [Mozilla Public License 2.0](LICENSE).
 
-Third-party dependencies use permissive licenses (BSD-2-Clause, BSD-3-Clause, Apache-2.0). See [NOTICE](NOTICE) for full attribution.
+Third-party dependencies use permissive licenses (BSD-2-Clause, BSD-3-Clause, Apache-2.0). mod_g729.so uses bcg729 (GPL-3.0) — GPL confined to that module only via RTLD_LOCAL. See [NOTICE](NOTICE) for full attribution.

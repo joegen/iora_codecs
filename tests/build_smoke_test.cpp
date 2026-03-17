@@ -46,6 +46,14 @@ extern "C" {
 #include <vpx/vpx_decoder.h>
 #endif
 
+// G.729 (bcg729, GPL-3.0)
+#ifdef IORA_CODECS_ENABLE_G729
+extern "C" {
+#include <bcg729/encoder.h>
+#include <bcg729/decoder.h>
+}
+#endif
+
 // AV1 (libaom + dav1d)
 #ifdef IORA_CODECS_ENABLE_AV1
 #include <aom/aom_encoder.h>
@@ -195,6 +203,23 @@ int main()
     dav1d_default_settings(&dav1d_settings);
     std::printf("[PASS] dav1d: default settings initialized\n");
     ++pass;
+  }
+#endif
+
+#ifdef IORA_CODECS_ENABLE_G729
+  ++total;
+  {
+    auto* enc = initBcg729EncoderChannel(0);
+    if (enc)
+    {
+      closeBcg729EncoderChannel(enc);
+      std::printf("[PASS] bcg729: encoder init/close OK (GPL-3.0)\n");
+      ++pass;
+    }
+    else
+    {
+      std::printf("[FAIL] bcg729: encoder init failed\n");
+    }
   }
 #endif
 

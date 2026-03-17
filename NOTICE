@@ -60,6 +60,15 @@ vo-amrwbenc
 
 ================================================================================
 
+bcg729 (G.729 Annex A)
+  Copyright Oleg Ovchinnikov, Belledonne Communications
+  License: GNU General Public License v3.0
+  https://github.com/BelledonneCommunications/bcg729
+  NOTE: GPL-3.0 scope is confined to mod_g729.so only.
+  This module is not built by default (IORA_CODECS_ENABLE_G729=OFF).
+
+================================================================================
+
 OpenH264
   Copyright 2013-2024 Cisco Systems, Inc.
   License: BSD-2-Clause
@@ -89,4 +98,5 @@ dav1d (AV1 decoder)
 ================================================================================
 
 All third-party libraries use permissive licenses (BSD-2-Clause, BSD-3-Clause,
-or Apache-2.0) compatible with the Mozilla Public License 2.0.
+or Apache-2.0) except bcg729 (GPL-3.0), which is confined to the optional
+mod_g729.so module via RTLD_LOCAL isolation and is not built by default.

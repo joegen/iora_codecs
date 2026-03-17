@@ -30,21 +30,50 @@ endif()
 include(cmake/CodecModules.cmake)
 
 # ==========================================================================
-# Framework: Iora (header-only interface library)
+# Framework: Iora (header-only interface + libiora-core.so shared library)
 # ==========================================================================
 # Iora's own CMakeLists.txt is not designed for add_subdirectory (uses
 # CMAKE_SOURCE_DIR, always builds the iora executable, fetches Catch2).
-# Since iora_lib is an INTERFACE header-only library, we create our own
-# target pointing directly at the headers. This avoids pulling in iora's
-# executable build, OpenSSL dependency (for the executable), and FetchContent
-# downloads (Catch2) that are not needed for iora_codecs.
+# We create our own targets: iora_core (shared lib for singleton state)
+# and iora_lib (INTERFACE that propagates headers + iora_core linkage).
+# This enables RTLD_LOCAL plugin loading for GPL codec isolation.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include/iora/iora.hpp")
+
+  # --- libiora-core.so: shared singleton state (Logger, IoraService, JsonFileStore) ---
+  # Cannot use add_subdirectory(libs/iora/src/core) because its CMakeLists.txt
+  # references ${CMAKE_SOURCE_DIR}/include which would resolve to iora_codecs' root.
+  find_package(Threads REQUIRED)
+  find_package(OpenSSL REQUIRED)
+
+  add_library(iora_core SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/src/core/iora_core.cpp"
+  )
+  target_include_directories(iora_core PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include"
+  )
+  target_compile_features(iora_core PUBLIC cxx_std_17)
+  target_link_libraries(iora_core PRIVATE
+    Threads::Threads
+    OpenSSL::SSL
+    OpenSSL::Crypto
+  )
+  target_compile_definitions(iora_core PRIVATE IORA_CORE_BUILDING)
+  set_target_properties(iora_core PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 1
+  )
+  message(STATUS "  -> iora_core: shared singleton library (libiora-core.so)")
+
+  # --- iora_lib: INTERFACE target linking headers + iora_core ---
   add_library(iora_lib INTERFACE)
   target_include_directories(iora_lib INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include"
   )
   target_compile_features(iora_lib INTERFACE cxx_std_17)
-  message(STATUS "  -> iora: header-only interface library (libs/iora/include)")
+  target_link_libraries(iora_lib INTERFACE iora_core)
+  target_compile_definitions(iora_lib INTERFACE IORA_CORE_SHARED)
+  message(STATUS "  -> iora_lib: header-only + iora_core (RTLD_LOCAL enabled)")
+
 else()
   message(WARNING "libs/iora not found. Run: git submodule update --init --recursive")
 endif()

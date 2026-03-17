@@ -102,6 +102,7 @@ libs/
   openh264/      # H.264 video codec
   libvpx/        # VP8/VP9 video codec
   libaom/        # AV1 encoder/decoder
+  bcg729/        # G.729 audio codec
   dav1d/         # AV1 fast decoder
 ```
 
@@ -119,6 +120,7 @@ libs/
 | openh264 | github.com/cisco/openh264 | v2.5.0 | BSD-2-Clause |
 | libvpx | chromium.googlesource.com/webm/libvpx | v1.14.1 | BSD-3-Clause |
 | libaom | aomedia.googlesource.com/aom | v3.10.0 | BSD-2-Clause |
+| bcg729 | github.com/BelledonneCommunications/bcg729 | 1.1.1 | GPL-3.0* |
 | dav1d | code.videolan.org/videolan/dav1d | 1.5.0 | BSD-2-Clause |
 
 ## Build Integration Methods
@@ -130,6 +132,7 @@ Each submodule is integrated into the CMake build using one of three methods:
 These submodules have their own `CMakeLists.txt` and integrate directly:
 
 - **libs/opus** — cache variables suppress tests/programs before `add_subdirectory`
+- **libs/bcg729** — cache variables suppress tests/strict before `add_subdirectory`
 - **libs/libilbc** — requires abseil-cpp nested submodule
 
 ### 2. Direct source compilation (trivial libraries)
@@ -193,6 +196,7 @@ cmake --build build -j$(nproc)
 | `IORA_CODECS_ENABLE_AMR` | OFF | AMR-NB/WB (patent encumbered, requires autotools) |
 | `IORA_CODECS_ENABLE_H264` | ON | H.264 via OpenH264 |
 | `IORA_CODECS_ENABLE_VPX` | ON | VP8/VP9 via libvpx |
+| `IORA_CODECS_ENABLE_G729` | OFF | G.729 via bcg729 (GPL-3.0, isolated via RTLD_LOCAL) |
 | `IORA_CODECS_ENABLE_AV1` | OFF | AV1 via libaom + dav1d (requires meson + ninja) |
 | `IORA_CODECS_BUILD_TESTS` | ON | Build test executables |
 | `IORA_CODECS_BUILD_EXAMPLES` | OFF | Build example programs |
@@ -292,13 +296,7 @@ git commit -m "Update <submodule> to <new-tag>"
 
 ## License Considerations
 
-- **G.729 (bcg729)** has been removed from iora_codecs because its GPL-3.0
-  license is incompatible with the project's permissive license model. The
-  GPL-3.0 requires that all linked code be GPL-compatible, and runtime isolation
-  via `dlopen`/`RTLD_LOCAL` is not feasible due to Iora's header-only singleton
-  architecture (Logger, IoraService share static state across all plugins via
-  `RTLD_GLOBAL`). G.729 patents have expired, so a clean-room BSD-licensed
-  implementation could be added in the future if needed.
+- **G.729 (bcg729)** is now available as an opt-in GPL-isolated plugin. bcg729 (GPL-3.0) is statically linked into mod_g729.so, which is loaded with `RTLD_LOCAL` to confine GPL symbols. The host application and all other modules remain permissively licensed. `IORA_CODECS_ENABLE_G729=OFF` by default — distributors shipping mod_g729.so must comply with GPL-3.0 for that binary only. G.729 patents expired worldwide by January 2017.
 - **opencore-amr / vo-amrwbenc (AMR)** are Apache-2.0 but the AMR codec itself
   is patent-encumbered. Commercial deployment may require a patent license from
   Via Licensing.
