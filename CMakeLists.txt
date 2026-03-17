@@ -30,18 +30,34 @@ endif()
 include(cmake/CodecModules.cmake)
 
 # ==========================================================================
-# Framework: Iora (header-only interface + libiora-core.so shared library)
+# Framework: Iora (find_package with submodule fallback)
 # ==========================================================================
-# Iora's own CMakeLists.txt is not designed for add_subdirectory (uses
-# CMAKE_SOURCE_DIR, always builds the iora executable, fetches Catch2).
-# We create our own targets: iora_core (shared lib for singleton state)
-# and iora_lib (INTERFACE that propagates headers + iora_core linkage).
-# This enables RTLD_LOCAL plugin loading for GPL codec isolation.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include/iora/iora.hpp")
+# Strategy:
+#   1. Try find_package(Iora) — works when iora is installed system-wide
+#      or via CMAKE_PREFIX_PATH from a superproject build.
+#   2. Fall back to building from libs/iora submodule for standalone dev.
+#
+# Either path provides the same two targets:
+#   iora_lib  — INTERFACE library (headers + libiora-core.so linkage + IORA_CORE_SHARED)
+#   iora_core — SHARED library (singleton state for RTLD_LOCAL plugin loading)
+# ==========================================================================
+find_package(Iora QUIET)
 
-  # --- libiora-core.so: shared singleton state (Logger, IoraService, JsonFileStore) ---
+if(Iora_FOUND)
+  # find_package(Iora) exports Iora::iora_lib and Iora::iora_core.
+  # Alias to unnamespaced names so all downstream CMakeLists.txt work unchanged.
+  if(NOT TARGET iora_lib)
+    add_library(iora_lib ALIAS Iora::iora_lib)
+  endif()
+  if(NOT TARGET iora_core)
+    add_library(iora_core ALIAS Iora::iora_core)
+  endif()
+  message(STATUS "  -> iora: found via find_package(Iora) [${Iora_DIR}]")
+
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include/iora/iora.hpp")
+  # Submodule fallback: build iora_core and iora_lib from the submodule.
   # Cannot use add_subdirectory(libs/iora/src/core) because its CMakeLists.txt
-  # references ${CMAKE_SOURCE_DIR}/include which would resolve to iora_codecs' root.
+  # references ${CMAKE_SOURCE_DIR}/include which resolves to our root.
   find_package(Threads REQUIRED)
   find_package(OpenSSL REQUIRED)
 
@@ -62,9 +78,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include/iora/iora.hpp")
     VERSION ${PROJECT_VERSION}
     SOVERSION 1
   )
-  message(STATUS "  -> iora_core: shared singleton library (libiora-core.so)")
 
-  # --- iora_lib: INTERFACE target linking headers + iora_core ---
   add_library(iora_lib INTERFACE)
   target_include_directories(iora_lib INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include"
@@ -72,10 +86,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/iora/include/iora/iora.hpp")
   target_compile_features(iora_lib INTERFACE cxx_std_17)
   target_link_libraries(iora_lib INTERFACE iora_core)
   target_compile_definitions(iora_lib INTERFACE IORA_CORE_SHARED)
-  message(STATUS "  -> iora_lib: header-only + iora_core (RTLD_LOCAL enabled)")
+  message(STATUS "  -> iora: built from submodule (libs/iora)")
 
 else()
-  message(WARNING "libs/iora not found. Run: git submodule update --init --recursive")
+  message(FATAL_ERROR
+    "Iora framework not found. Either:\n"
+    "  1. Install iora and set CMAKE_PREFIX_PATH, or\n"
+    "  2. Run: git submodule update --init --recursive")
 endif()
 
 # ==========================================================================
